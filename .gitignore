@@ -1,0 +1,4 @@
+/.vscode
+test.cc
+*.o
+*.out
