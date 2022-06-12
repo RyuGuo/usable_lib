@@ -27,23 +27,23 @@
     size_t l = strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S.", &tm);        \
     sprintf(tbuf + l, "%06d", (int)tv.tv_usec);                                \
     fprintf(stream, "[%s] [%d] %s:%d: " format "\n", tbuf, gettid(), __FILE__, \
-            __LINE__, __VA_ARGS__);                                            \
+            __LINE__, ##__VA_ARGS__);                                          \
   } while (0)
 
 #define DLOG_INFO(format, ...)                                                 \
-  DLOG_STREAM(stderr, "[INFO] " format, __VA_ARGS__)
+  DLOG_STREAM(stderr, "[INFO] " format, ##__VA_ARGS__)
 #define DLOG_ERROR(format, ...)                                                \
-  DLOG_STREAM(stderr, "[ERROR] " format, __VA_ARGS__)
+  DLOG_STREAM(stderr, "[ERROR] " format, ##__VA_ARGS__)
 #define DLOG_WARNING(format, ...)                                              \
-  DLOG_STREAM(stderr, "[WARNING] " format, __VA_ARGS__)
+  DLOG_STREAM(stderr, "[WARNING] " format, ##__VA_ARGS__)
 
-#define DLOG(format, ...) DLOG_INFO(format, __VA_ARGS__)
+#define DLOG(format, ...) DLOG_INFO(format, ##__VA_ARGS__)
 
 #define DLOG_FILE(file, format, ...)                                           \
   do {                                                                         \
     FILE *fp = fopen(file, "w+");                                              \
     assert(fp != NULL);                                                        \
-    DLOG_STREAM(fp, format, __VA_ARGS__);                                      \
+    DLOG_STREAM(fp, format, ##__VA_ARGS__);                                    \
     fclose(fp);                                                                \
   } while (0)
 

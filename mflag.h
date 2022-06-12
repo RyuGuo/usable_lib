@@ -132,10 +132,12 @@ inline std::string mflag_match<std::string>(const std::string &tag, int argc,
 }
 
 template <typename R>
-inline R mflag_match(const std::string &tag, int argc, char **argv, const R &default_val);
+inline R mflag_match(const std::string &tag, int argc, char **argv,
+                     const R &default_val);
 
 template <>
-inline int mflag_match<int>(const std::string &tag, int argc, char **argv, const int &default_val) {
+inline int mflag_match<int>(const std::string &tag, int argc, char **argv,
+                            const int &default_val) {
   for (int i = 1; i < argc; ++i) {
     std::string ttag = "--" + tag + "=";
     if (memcmp(argv[i], ("--" + tag + "=").c_str(), ttag.size()) == 0) {
@@ -146,7 +148,8 @@ inline int mflag_match<int>(const std::string &tag, int argc, char **argv, const
 }
 
 template <>
-inline float mflag_match<float>(const std::string &tag, int argc, char **argv, const float &default_val) {
+inline float mflag_match<float>(const std::string &tag, int argc, char **argv,
+                                const float &default_val) {
   for (int i = 1; i < argc; ++i) {
     std::string ttag = "--" + tag + "=";
     if (memcmp(argv[i], ("--" + tag + "=").c_str(), ttag.size()) == 0) {
@@ -158,7 +161,8 @@ inline float mflag_match<float>(const std::string &tag, int argc, char **argv, c
 
 template <>
 inline std::string mflag_match<std::string>(const std::string &tag, int argc,
-                                            char **argv, const std::string &default_val) {
+                                            char **argv,
+                                            const std::string &default_val) {
   for (int i = 1; i < argc; ++i) {
     std::string ttag = "--" + tag + "=";
     if (memcmp(argv[i], ("--" + tag + "=").c_str(), ttag.size()) == 0) {
@@ -167,6 +171,5 @@ inline std::string mflag_match<std::string>(const std::string &tag, int argc,
   }
   return default_val;
 }
-
 
 #endif // __MFLAG_H__

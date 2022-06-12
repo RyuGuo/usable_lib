@@ -13,18 +13,6 @@
 #include <algorithm>
 #include <atomic>
 
-inline int rol(int in, int x) {
-  int res;
-  __asm__ __volatile__("rol  %%eax, %%cl" : "=a"(res) : "a"(in), "c"(x));
-  return res;
-}
-
-inline int ror(int in, int x) {
-  int res;
-  __asm__ __volatile__("ror  %%eax, %%cl" : "=a"(res) : "a"(in), "c"(x));
-  return res;
-}
-
 inline void barrier() { __asm__ __volatile__("" : : : "memory"); }
 
 template <typename T>

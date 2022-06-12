@@ -18,17 +18,12 @@ class shared_mutex {
 
 public:
   shared_mutex() { pthread_rwlock_init(&rwlock, nullptr); }
-
   ~shared_mutex() { pthread_rwlock_destroy(&rwlock); }
 
   void lock_shared() { pthread_rwlock_rdlock(&rwlock); }
-
   bool try_lock_shared() { return pthread_rwlock_tryrdlock(&rwlock) == 0; }
-
   bool try_lock() { return pthread_rwlock_trywrlock(&rwlock) == 0; }
-
   void lock() { pthread_rwlock_wrlock(&rwlock); }
-
   void unlock() { pthread_rwlock_unlock(&rwlock); }
 };
 
@@ -43,9 +38,7 @@ public:
   ~spin_mutex() { pthread_spin_destroy(&spinlock); }
 
   void lock() { pthread_spin_lock(&spinlock); }
-
   bool try_lock() { return pthread_spin_trylock(&spinlock) == 0; }
-
   void unlock() { pthread_spin_unlock(&spinlock); }
 };
 
@@ -63,6 +56,7 @@ class barrier {
 public:
   barrier() { pthread_barrier_init(&b, nullptr, 0); }
   ~barrier() { pthread_barrier_destroy(&b); }
+
   void init(unsigned int count) { pthread_barrier_init(&b, nullptr, count); }
   void wait() { pthread_barrier_wait(&b); }
 };
