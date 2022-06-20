@@ -27,6 +27,7 @@ template <typename T, typename Alloc = std::allocator<T>> class ConQueue {
    * [][][][][][][]
    */
   T *ring;
+  bool self_alloc;
   std::atomic<uint32_t> h, h_;
   std::atomic<uint32_t> t, t_;
   uint32_t flags;
@@ -42,10 +43,14 @@ template <typename T, typename Alloc = std::allocator<T>> class ConQueue {
   }
 
 public:
-  ConQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                                               ConQueueMode::F_MC_HTS_DEQ |
-                                               ConQueueMode::F_EXACT_SZ)
-      : flags(flags), h(0), h_(0), t(0), t_(0), _max_size(max_size) {
+  ConQueue(T *ring, uint32_t max_size,
+           uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
+                            ConQueueMode::F_MC_HTS_DEQ |
+                            ConQueueMode::F_EXACT_SZ)
+      : ring(ring), flags(flags), h(0), h_(0), t(0), t_(0), _max_size(max_size),
+        self_alloc(false) {
+    if (ring == nullptr)
+      throw "ring array is nullptr";
     if (max_size == 0)
       throw "max_size is 0";
     if ((flags & F_SP_ENQ) &&
@@ -62,24 +67,32 @@ public:
       max_size |= max_size >> 16;
     }
     count = max_size;
-    ring = Alloc().allocate(max_size * sizeof(T));
+  }
+  ConQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
+                                               ConQueueMode::F_MC_HTS_DEQ |
+                                               ConQueueMode::F_EXACT_SZ)
+      : ConQueue(Alloc().allocate(max_size * sizeof(T)), max_size, flags) {
+    self_alloc = true;
   }
   ~ConQueue() {
-    uint32_t h = h_, t = t_;
-    for (uint32_t i = h; i != t; --i) {
-      ring[to_id(i - 1)].~T();
+    uint32_t _h = h, _t = t;
+    for (uint32_t i = _t; i != _h; ++i) {
+      ring[to_id(i)].~T();
     }
-    Alloc().deallocate(ring, _max_size);
+    if (self_alloc)
+      Alloc().deallocate(ring, _max_size);
   }
   bool empty() { return h_ == t_; }
   bool full() { return h_ - t_ == _max_size; }
   uint32_t size() { return h_ - t_; }
+  uint32_t capacity() { return _max_size; }
   // Guarantee that the reference will not be poped
   T &front() { return ring[t_]; }
-  void push(const T &__x) {
+  void clear() { pop_out_bulk(nullptr, size()); }
+  bool push(const T &__x) {
     if (flags & ConQueueMode::F_SP_ENQ) {
       if (h - t_ == _max_size)
-        throw "queue full";
+        return false;
       ::new (&ring[to_id(h)]) T(__x);
       ++h;
       ++h_;
@@ -87,7 +100,7 @@ public:
       uint32_t _h = h, _h_;
       do {
         if (_h - t_ == _max_size)
-          throw "queue full";
+          return false;
       } while (!h.compare_exchange_weak(
           _h, _h + 1, std::memory_order::memory_order_relaxed));
       ::new (&ring[to_id(_h)]) T(__x);
@@ -99,53 +112,62 @@ public:
         _h_ = _h;
       }
     }
+    return true;
   }
-  void push_burst(const T *v, size_t size) {
+  /**
+   * @brief
+   *
+   * @param v
+   * @param size
+   * @return The number of successful elem
+   */
+  uint32_t push_bulk(const T *v, uint32_t size) {
+    uint32_t l;
     if (flags & ConQueueMode::F_SP_ENQ) {
-      if (h - t_ + size > _max_size)
-        throw "queue full";
-      for (uint32_t i = 0; i < size; ++i) {
+      l = std::min(_max_size - h + t_, size);
+      for (uint32_t i = 0; i < l; ++i) {
         ::new (&ring[to_id(h + i)]) T(v[i]);
       }
-      h += size;
-      h_ += size;
+      h += l;
+      h_ += l;
     } else {
       uint32_t _h = h, _h_;
       do {
-        if (_h - t_ + size > _max_size)
-          throw "queue full";
+        l = std::min(_max_size - _h + t_, size);
       } while (!h.compare_exchange_weak(
-          _h, _h + size, std::memory_order::memory_order_relaxed));
-      for (uint32_t i = 0; i < size; ++i) {
+          _h, _h + l, std::memory_order::memory_order_relaxed));
+      for (uint32_t i = 0; i < l; ++i) {
         ::new (&ring[to_id(_h + i)]) T(v[i]);
       }
       // Wait for other threads to finish copying
       _h_ = _h;
       while (!h_.compare_exchange_weak(
-          _h_, _h_ + size, std::memory_order::memory_order_relaxed)) {
+          _h_, _h_ + l, std::memory_order::memory_order_relaxed)) {
         std::this_thread::yield();
         _h_ = _h;
       }
     }
+    return l;
   }
-  void push_burst(const std::vector<T> &v) { push_burst(v.data(), v.size()); }
-  T pop_out() {
+  uint32_t push_bulk(const std::vector<T> &v) {
+    return push_bulk(v.data(), v.size());
+  }
+  bool pop_out(T *__x) {
     if (flags & ConQueueMode::F_SC_DEQ) {
       if (t == h_)
-        throw "queue empty";
-      T __x = ring[to_id(t)];
+        return false;
+      *__x = ring[to_id(t)];
       ring[to_id(t)].~T();
       ++t;
       ++t_;
-      return __x;
     } else {
       uint32_t _t = t, _t_;
       do {
         if (_t == h_)
-          throw "queue empty";
+          return false;
       } while (!t.compare_exchange_weak(
           _t, _t + 1, std::memory_order::memory_order_relaxed));
-      T __x = ring[to_id(_t)];
+      *__x = ring[to_id(_t)];
       ring[to_id(_t)].~T();
       // Wait for other threads to finish copying
       _t_ = _t;
@@ -154,14 +176,16 @@ public:
         std::this_thread::yield();
         _t_ = _t;
       }
-      return __x;
     }
+    return true;
   }
-  uint32_t pop_out_burst(T *v, uint32_t count) {
+  uint32_t pop_out_bulk(T *v, uint32_t count) {
     uint32_t l = 0;
     if (flags & ConQueueMode::F_SC_DEQ) {
       while (count != 0 && t < h_) {
-        v[l] = ring[to_id(t + l)];
+        if (v) {
+          v[l] = ring[to_id(t + l)];
+        }
         ring[to_id(t + l)].~T();
         --count;
         ++l;
@@ -171,11 +195,13 @@ public:
     } else {
       uint32_t _t = t, _t_, c;
       do {
-        c = std::min(count, h_.load() - _t);
+        c = std::min(count, h_ - _t);
       } while (!t.compare_exchange_weak(
           _t, c + _t, std::memory_order::memory_order_relaxed));
       while (c != 0) {
-        v[l] = ring[to_id(_t + l)];
+        if (v) {
+          v[l] = ring[to_id(_t + l)];
+        }
         ring[to_id(_t + l)].~T();
         --c;
         ++l;
@@ -190,12 +216,38 @@ public:
     }
     return l;
   }
-  template <typename... Args, typename _Alloc = std::allocator<T>>
-  std::vector<T, _Alloc> pop_out_burst(uint32_t count,
-                                       Args &&...construct_args) {
-    std::vector<T, _Alloc> v(count, T(std::forward<Args>(construct_args)...));
-    uint32_t l = pop_out_burst(v.data(), count);
-    v.resize(l);
+  template <typename... Args> std::vector<T> pop_out_bulk(uint32_t count) {
+    std::vector<T> v;
+    uint32_t l = 0;
+    if (flags & ConQueueMode::F_SC_DEQ) {
+      while (count != 0 && t < h_) {
+        v.push_back(ring[to_id(t + l)]);
+        ring[to_id(t + l)].~T();
+        --count;
+        ++l;
+      }
+      t += l;
+      t_ += l;
+    } else {
+      uint32_t _t = t, _t_, c;
+      do {
+        c = std::min(count, h_ - _t);
+      } while (!t.compare_exchange_weak(
+          _t, c + _t, std::memory_order::memory_order_relaxed));
+      while (c != 0) {
+        v.push_back(ring[to_id(_t + l)]);
+        ring[to_id(_t + l)].~T();
+        --c;
+        ++l;
+      }
+      // Wait for other threads to finish copying
+      _t_ = _t;
+      while (!t_.compare_exchange_weak(
+          _t_, _t_ + l, std::memory_order::memory_order_relaxed)) {
+        std::this_thread::yield();
+        _t_ = _t;
+      }
+    }
     return v;
   }
 };

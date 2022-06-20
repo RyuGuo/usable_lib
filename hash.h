@@ -8,8 +8,6 @@
 #ifndef __HASH_H__
 #define __HASH_H__
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string>
 
 inline int rol32(int in, int x) {
@@ -36,13 +34,9 @@ inline uint32_t ror32(uint32_t in, int x) {
   return res;
 }
 
-inline uint64_t rol64(int64_t in, int x) {
-  return (in << x) | (in >> (64 - x));
-}
+inline int64_t rol64(int64_t in, int x) { return (in << x) | (in >> (64 - x)); }
 
-inline uint64_t ror64(int64_t in, int x) {
-  return (in >> x) | (in << (64 - x));
-}
+inline int64_t ror64(int64_t in, int x) { return (in >> x) | (in << (64 - x)); }
 
 inline uint64_t rol64(uint64_t in, int x) {
   return (in << x) | (in >> (64 - x));
@@ -68,23 +62,7 @@ public:
   hash32() : seed(0) {}
   hash32(int seed) : seed(seed) {}
 
-  uint32_t operator()(uint32_t x) {
-    uint32_t h1 = seed;
-    const uint32_t c1 = 0xcc9e2d51;
-    const uint32_t c2 = 0x1b873593;
-
-    x *= c1;
-    x = rol32(x, 15);
-    x *= c2;
-
-    h1 ^= x;
-    h1 = rol32(h1, 13);
-    h1 = h1 * 5 + 0xe6546b64;
-
-    h1 ^= 4;
-    h1 = fmix32(h1);
-    return h1;
-  }
+  uint32_t operator()(uint32_t x) { return ror32(x * 0x9e3779b1U, 24); }
 
   uint32_t operator()(const void *s, uint32_t len) {
     const uint8_t *data = (const uint8_t *)s;
@@ -134,25 +112,7 @@ public:
   hash64(int seed) : seed(seed) {}
 
   uint64_t operator()(uint64_t x) {
-    const uint64_t m = 0xc6a4a7935bd1e995;
-    const int r = 47;
-
-    uint64_t h = seed ^ (8 * m);
-
-    uint64_t k = x;
-
-    k *= m;
-    k ^= k >> r;
-    k *= m;
-
-    h ^= k;
-    h *= m;
-
-    h ^= h >> r;
-    h *= m;
-    h ^= h >> r;
-
-    return h;
+    return ror64(x * 0x9e3779b97f4a7c15LU, 24);
   }
 
   uint64_t operator()(const void *s, uint32_t len) {

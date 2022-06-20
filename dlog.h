@@ -49,12 +49,12 @@
 
 #define DLOG_IF(expr, format, ...)                                             \
   if (expr)                                                                    \
-  DLOG(format, __VA_ARGS__)
+  DLOG(format, ##__VA_ARGS__)
 
 #define DLOG_ASSERT(expr, format, ...)                                         \
   do {                                                                         \
     if (__glibc_unlikely(expr)) {                                              \
-      DLOG_ERROR(format, __VA_ARGS__);                                         \
+      DLOG_ERROR(format, ##__VA_ARGS__);                                       \
       exit(1);                                                                 \
     }                                                                          \
   } while (0)

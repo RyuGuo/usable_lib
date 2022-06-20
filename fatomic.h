@@ -12,15 +12,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
 
 inline void barrier() { __asm__ __volatile__("" : : : "memory"); }
 
 template <typename T>
 inline T
 atomic_max(std::atomic<T> &e, T val,
-           std::memory_order s = std::memory_order::memory_order_seq_cst) {
-  T _e = e.load();
-  while (!e.compare_exchange_weak(_e, std::max(_e, val), s)) {
+           std::memory_order s = std::memory_order::memory_order_seq_cst,
+           std::memory_order f = std::memory_order::memory_order_seq_cst) {
+  T _e = e.load(s);
+  while (!e.compare_exchange_weak(_e, std::max(_e, val), s, f)) {
+    std::this_thread::yield();
   }
   return _e;
 }
@@ -28,9 +31,11 @@ atomic_max(std::atomic<T> &e, T val,
 template <typename T>
 inline T
 atomic_min(std::atomic<T> &e, T val,
-           std::memory_order s = std::memory_order::memory_order_seq_cst) {
-  T _e = e.load();
-  while (!e.compare_exchange_weak(_e, std::min(_e, val), s)) {
+           std::memory_order s = std::memory_order::memory_order_seq_cst,
+           std::memory_order f = std::memory_order::memory_order_seq_cst) {
+  T _e = e.load(s);
+  while (!e.compare_exchange_weak(_e, std::min(_e, val), s, f)) {
+    std::this_thread::yield();
   }
   return _e;
 }
@@ -38,32 +43,39 @@ atomic_min(std::atomic<T> &e, T val,
 template <typename T>
 inline T
 atomic_max(volatile T *e, T val,
-           std::memory_order s = std::memory_order::memory_order_seq_cst) {
+           std::memory_order s = std::memory_order::memory_order_seq_cst,
+           std::memory_order f = std::memory_order::memory_order_seq_cst) {
   T _e = *e;
-  while (!__atomic_compare_exchange_weak(e, _e, std::max(_e, val), s)) {
+  while (!__atomic_compare_exchange_n(e, &_e, std::max(_e, val), true, int(s),
+                                      int(f))) {
+    std::this_thread::yield();
   }
-  return std::max(_e, val);
+  return _e;
 }
 
 template <typename T>
 inline T
 atomic_min(volatile T *e, T val,
-           std::memory_order s = std::memory_order::memory_order_seq_cst) {
+           std::memory_order s = std::memory_order::memory_order_seq_cst,
+           std::memory_order f = std::memory_order::memory_order_seq_cst) {
   T _e = *e;
-  while (!__atomic_compare_exchange_weak(e, _e, std::min(_e, val), s)) {
+  while (!__atomic_compare_exchange_n(e, &_e, std::min(_e, val), true, int(s),
+                                      int(f))) {
+    std::this_thread::yield();
   }
-  return std::min(_e, val);
+  return _e;
 }
 
 template <typename T, typename P>
 inline bool
 atomic_store_if(std::atomic<T> &e, T val, P fn,
-                std::memory_order s = std::memory_order::memory_order_seq_cst) {
-  T _e = e.load(int(s));
+                std::memory_order s = std::memory_order::memory_order_seq_cst,
+                std::memory_order f = std::memory_order::memory_order_seq_cst) {
+  T _e = e.load(s);
   while (fn(_e, val)) {
-    if (e.compare_exchange_weak(_e, val, int(s))) {
+    if (e.compare_exchange_weak(_e, val, s, f))
       return true;
-    }
+    std::this_thread::yield();
   }
   return false;
 }
@@ -71,35 +83,38 @@ atomic_store_if(std::atomic<T> &e, T val, P fn,
 template <typename T, typename P>
 inline bool
 atomic_store_if(volatile T *e, T val, P fn,
-                std::memory_order s = std::memory_order::memory_order_seq_cst) {
+                std::memory_order s = std::memory_order::memory_order_seq_cst,
+                std::memory_order f = std::memory_order::memory_order_seq_cst) {
   T _e = *e;
   while (fn(_e, val)) {
-    if (__atomic_compare_exchange_weak(e, _e, val, int(s))) {
+    if (__atomic_compare_exchange_n(e, &_e, val, true, int(s), int(f)))
       return true;
-    }
+    std::this_thread::yield();
   }
   return false;
 }
 
-template <typename T>
+template <typename T, typename P>
 inline T atomic_store_as_func(
-    std::atomic<T> &e, T (*fn)(T e),
-    std::memory_order s = std::memory_order::memory_order_seq_cst) {
-  T _e = e.load(int(s)), t;
-  do {
-    t = fn(_e);
-  } while (e.compare_exchange_weak(_e, t, int(s)));
+    std::atomic<T> &e, P fn,
+    std::memory_order s = std::memory_order::memory_order_seq_cst,
+    std::memory_order f = std::memory_order::memory_order_seq_cst) {
+  T _e = e.load(s);
+  while (!e.compare_exchange_weak(_e, fn(_e), s, f)) {
+    std::this_thread::yield();
+  }
   return _e;
 }
 
-template <typename T>
+template <typename T, typename P>
 inline T atomic_store_as_func(
-    volatile T *e, T (*fn)(T e),
-    std::memory_order s = std::memory_order::memory_order_seq_cst) {
-  T _e = *e, t;
-  do {
-    t = fn(_e);
-  } while (__atomic_compare_exchange_weak(e, _e, t, int(s)));
+    volatile T *e, P fn,
+    std::memory_order s = std::memory_order::memory_order_seq_cst,
+    std::memory_order f = std::memory_order::memory_order_seq_cst) {
+  T _e = *e;
+  while (!__atomic_compare_exchange_n(e, &_e, fn(_e), true, int(s), int(f))) {
+    std::this_thread::yield();
+  }
   return _e;
 }
 
