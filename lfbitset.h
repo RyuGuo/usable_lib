@@ -15,14 +15,14 @@ class lfbitset_base {
 
 public:
   lfbitset_base(uint64_t Nbits)
-      : widx(0), align_N((Nbits + 63) / 64), self_alloc(true) {
+      : widx(0), _Nbits(Nbits), align_N((Nbits + 63) / 64), self_alloc(true) {
     bitword = new uint64_t[align_N];
     if (bitword == nullptr)
       throw "Out of memory";
     reset();
   }
-  lfbitset_base(uint64_t *bitword, uint64_t Nbits)
-      : bitword(bitword), widx(0), align_N((Nbits + 63) / 64),
+  lfbitset_base(volatile uint64_t *bitword, uint64_t Nbits)
+      : bitword(bitword), widx(0), _Nbits(Nbits), align_N((Nbits + 63) / 64),
         self_alloc(false) {
     reset();
   }
@@ -30,7 +30,7 @@ public:
     if (self_alloc)
       delete bitword;
   }
-  uint64_t capacity() const { return align_N; }
+  uint64_t capacity() const { return _Nbits; }
   void reset() {
     for (uint64_t i = 0; i < align_N; ++i) {
       bitword[i] = 0;
@@ -134,6 +134,8 @@ template <> class lfbitset<64> {
 
 public:
   lfbitset() { reset(); }
+
+  uint64_t capacity() const { return 64; }
 
   void reset() { bitword = 0; }
   bool none() const { return bitword == 0; }

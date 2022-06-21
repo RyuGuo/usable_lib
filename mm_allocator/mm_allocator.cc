@@ -1,5 +1,6 @@
 #include "mm_allocator.h"
 #include "./../conqueue.h"
+#include "./../extend_mutex.h"
 #include "./../fatomic.h"
 #include "./../lfbitset.h"
 #include <algorithm>
@@ -12,9 +13,11 @@
 
 #define SLAB_UNIT_SIZE 64
 #define SIZE_CLASS_NUM 32
+#define SLICE_UNIT_SIZE 64
 #define BLOCK_SIZE 4096
 #define CHUNK_SIZE 262144
 #define BLOCK_NUM_PER_CHUNK (CHUNK_SIZE / BLOCK_SIZE)
+#define SLICE_UNIT_NUM_PER_CHUNK (CHUNK_SIZE / SLICE_UNIT_SIZE)
 
 using chunk_id_t = uint64_t;
 using block_id_t = uint64_t; // start at 1
@@ -62,6 +65,7 @@ struct seg_allocator_t {
    */
   std::set<std::pair<size_t, uint64_t>> free_seg_set_siz;
   std::map<uint64_t, size_t> free_seg_set_off;
+  shared_mutex lock;
 
   void init(uint64_t base, size_t size) {
     free_seg_set_siz.clear();
@@ -70,13 +74,14 @@ struct seg_allocator_t {
     free_seg_set_off.insert(std::make_pair(base, size));
   }
   bool has_free_seg(size_t size) {
-
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     return iter != free_seg_set_siz.end();
   }
   uint64_t alloc(size_t size) {
+    lock.lock_shared();
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     if (iter == free_seg_set_siz.end()) {
+      lock.unlock();
       return -1;
     }
     uint64_t off = iter->second;
@@ -87,29 +92,36 @@ struct seg_allocator_t {
     }
     free_seg_set_off.erase(iter->second);
     free_seg_set_siz.erase(iter);
+    lock.unlock();
     return off;
   }
   void free(uint64_t off, size_t size) {
+    lock.lock();
     auto next = free_seg_set_off.lower_bound(off);
     int flag = 0;
+    // check if merge next seg
     if (next != free_seg_set_off.end() && off + size == next->first) {
       flag |= 1;
     }
 
     auto iter = next--; // prev
+    // check if merge prev seg
     if (next != free_seg_set_off.end() && next->first + next->second == off) {
       flag |= 2;
     }
 
     switch (flag) {
     case 0:
-      free_seg_set_off.insert(std::make_pair(off, size));
       free_seg_set_siz.insert(std::make_pair(size, off));
+      free_seg_set_off.insert(std::make_pair(off, size));
       break;
     case 1:
       free_seg_set_siz.erase(std::make_pair(iter->second, iter->first));
-      iter->second += size;
-      free_seg_set_siz.insert(std::make_pair(iter->second, iter->first));
+      free_seg_set_siz.insert(
+          std::make_pair(iter->second + size, iter->first - size));
+      free_seg_set_off.insert(
+          std::make_pair(iter->first - size, iter->second + size));
+      free_seg_set_off.erase(iter);
       break;
     case 2:
       free_seg_set_siz.erase(std::make_pair(next->second, next->first));
@@ -124,6 +136,7 @@ struct seg_allocator_t {
       free_seg_set_siz.insert(std::make_pair(next->second, next->first));
       break;
     }
+    lock.unlock();
   }
 };
 struct seg_allocator_greater_t : public seg_allocator_t {
@@ -149,22 +162,22 @@ struct seg_allocator_greater_t : public seg_allocator_t {
 
 /**
  * 存储布局
- *          4nKB          1MB    1MB
+ *          4nKB         256KB  256KB
  * |---------^---------||--^--||--^--|
  * [superblock][headers][chunk][chunk]...
  *                      |-------v--------|
- *                         N ≈ C / 1MB
+ *                         N ≈ C / 256KB
  *
  * superblock: global_meta, free_chunk_bitset
  * headers: [chunk_hdr][block_hdr][block_hdr]...[block_hdr]     |
  *          [chunk_hdr][block_hdr][block_hdr]...[block_hdr]...  > N
  *                     |-----------------v----------------|     |
- *                                     256
+ *                                      64
  *          4KB
  *        |--^--|
  * chunk: [block][block]...
  *        |-------v-------|
- *               256
+ *                64
  *
  *            64B
  *        |----^----|
@@ -215,7 +228,10 @@ struct mm_global_header {
 struct mm_hdr_layout {
   struct {
     mm_chunk_header ch;
-    mm_block_header bh[BLOCK_NUM_PER_CHUNK];
+    union {
+      mm_block_header bh[BLOCK_NUM_PER_CHUNK];
+      lfbitset<SLICE_UNIT_NUM_PER_CHUNK> slice_bitset;
+    };
   } hdr_zone[0];
 };
 
@@ -244,12 +260,13 @@ struct dram_chunk_meta {
 
   std::atomic<uint8_t> lock;
 
-  std::atomic<uint32_t> block_used_num;
   seg_allocator_t huge_allocator;
 
   union {
     ConQueue<block_id_t> *free_block;
     size_t huge_size;
+    std::atomic<uint32_t> block_used_num;
+    std::atomic<uint32_t> slice_used_num;
   };
 };
 
@@ -261,6 +278,7 @@ struct dram_global_pool_meta {
   std::atomic<uint64_t> chunk_used_num;
 
   ConQueue<dram_chunk_meta *> *almost_free_chunk;
+  ConQueue<dram_chunk_meta *> *almost_slice_free_chunk;
   seg_allocator_greater_t huge_chunk_allocator;
 
   mm_block_header &get_mm_block_header(block_id_t block_id) {
@@ -378,10 +396,10 @@ void mm_allocator::env_init(void *addr, size_t max_size,
   for (uint64_t i = 0; i < chunk_num; ++i) {
     auto &hz = layout.hl->hdr_zone[i];
     hz.ch.block_free_meta.free_block_bitset.reset();
-    for (uint64_t j = 0; j < BLOCK_NUM_PER_CHUNK; ++j) {
-      hz.bh[j].bitset.reset();
-      hz.bh[j].size_cls = -1;
-    }
+    // for (uint64_t j = 0; j < BLOCK_NUM_PER_CHUNK; ++j) {
+    //   hz.bh[j].bitset.reset();
+    //   hz.bh[j].size_cls = -1;
+    // }
   }
   layout.data_offset = data_offset;
   layout.data = ADDR + data_offset;
@@ -416,6 +434,13 @@ void mm_allocator::env_init(void *addr, size_t max_size,
   global_pool->meta_use_memory +=
       sizeof(*global_pool->almost_free_chunk) +
       global_pool->almost_free_chunk->capacity() * 8;
+  global_pool->almost_slice_free_chunk =
+      new ConQueue<dram_chunk_meta *>(chunk_num);
+  if (global_pool->almost_slice_free_chunk == nullptr)
+    throw "Out of memory";
+  global_pool->meta_use_memory +=
+      sizeof(*global_pool->almost_slice_free_chunk) +
+      global_pool->almost_slice_free_chunk->capacity() * 8;
 
   MM_FLUSH = mm_flush;
   MM_DRAIN = mm_drain;
@@ -427,6 +452,7 @@ void mm_allocator::env_init(void *addr, size_t max_size,
 void mm_allocator::env_release() {
   STATUS = false;
   delete global_pool->almost_free_chunk;
+  delete global_pool->almost_slice_free_chunk;
   for (uint64_t i = 0; i < global_pool->layout.chunk_num; ++i) {
     if (chunk_metas[i].free_block)
       delete chunk_metas[i].free_block;
@@ -514,13 +540,19 @@ static int get_raw_chunk(chunk_id_t *chunk_id, chunk_type type) {
   *chunk_id = chunk_meta->id;
   ch->type = type;
   chunk_meta->type = type;
-  ch->block_free_meta.free_block_bitset.reset();
   chunk_meta->block_used_num = 0;
   if (type == tSMALL) {
+    auto &bitset = ch->block_free_meta.free_block_bitset;
+    ch->block_free_meta.free_block_bitset.reset();
+    MM_FLUSH(bitset.to_ulong(), ceil(bitset.capacity(), sizeof(uint64_t)));
     chunk_meta->free_block = new ConQueue<block_id_t>(BLOCK_NUM_PER_CHUNK);
     global_pool->meta_use_memory +=
         sizeof(*chunk_meta->free_block) +
         chunk_meta->free_block->capacity() * sizeof(block_id_t);
+  } else if (type == tBIG) {
+    auto &bitset = global_pool->layout.hl->hdr_zone[*chunk_id].slice_bitset;
+    new (&bitset) std::remove_reference<decltype(bitset)>::type();
+    MM_FLUSH(bitset.to_ulong(), ceil(bitset.capacity(), sizeof(uint64_t)));
   }
   mm_obj_sync_nodrain(ch);
   mm_obj_sync_nodrain(global_pool->layout.free_chunk_bitset->to_ulong() +
@@ -572,7 +604,7 @@ retry:
 
   do {
     global_pool->almost_free_chunk->pop_out(&new_chunk_meta);
-  } while (new_chunk_meta != nullptr && new_chunk_meta->free_block == nullptr);
+  } while (new_chunk_meta != nullptr && new_chunk_meta->block_used_num == 0);
 
   if (new_chunk_meta != nullptr) {
     new_chunk_meta->lock ^= 2;
@@ -600,40 +632,58 @@ finish2:
 
 static uint64_t big_alloc_in_chunk(size_t size) {
   chunk_id_t chunk_id;
-  block_id_t block_id = 0;
   int rc = 0;
   uint64_t ret_off;
-  uint64_t alloc_block_num = ceil(size + sizeof(size_t), BLOCK_SIZE);
-  size_t alloc_size = alloc_block_num * BLOCK_SIZE;
+  uint64_t alloc_slice_num = ceil(size + sizeof(size_t), SLICE_UNIT_SIZE);
+  size_t alloc_size = alloc_slice_num * SLAB_UNIT_SIZE;
 retry:
+  dram_chunk_meta *new_chunk_meta = nullptr;
   if (theap.huge_chunk != nullptr &&
-      theap.huge_chunk->huge_allocator.has_free_seg(alloc_block_num)) {
-    int block_idx = theap.huge_chunk->huge_allocator.alloc(alloc_block_num);
-    block_id = get_block_id(chunk_id, block_idx);
-    for (uint64_t i = 0; i < alloc_block_num; ++i) {
-      theap.huge_chunk->hdr->block_free_meta.free_block_bitset.set(block_idx +
-                                                                   i);
+      theap.huge_chunk->huge_allocator.has_free_seg(alloc_slice_num)) {
+    chunk_id = theap.huge_chunk->id;
+    dram_chunk_meta &chunk_meta = chunk_metas[chunk_id];
+    uint64_t raw_slice_idx_pre =
+        theap.huge_chunk->huge_allocator.alloc(alloc_slice_num);
+    auto &bitset = global_pool->layout.hl->hdr_zone[chunk_id].slice_bitset;
+    for (uint64_t i = 0; i < alloc_slice_num; ++i) {
+      bitset.set(raw_slice_idx_pre + i);
     }
-    theap.huge_chunk->block_used_num += alloc_block_num;
-    ret_off = global_pool->layout.data_offset + (block_id - 1) * BLOCK_SIZE;
+    ++theap.huge_chunk->slice_used_num;
+    ret_off = chunk_id * CHUNK_SIZE + raw_slice_idx_pre * SLAB_UNIT_SIZE;
     *(size_t *)(global_pool->layout.data + ret_off) = size;
     MM_FLUSH(global_pool->layout.data + ret_off, sizeof(size_t));
-    ret_off += sizeof(size_t);
-    MM_FLUSH(
-        theap.huge_chunk->hdr->block_free_meta.free_block_bitset.to_ulong() +
-            block_idx / 64,
-        ceil(alloc_block_num, sizeof(uint64_t)));
+    ret_off += global_pool->layout.data_offset + sizeof(size_t);
+    MM_FLUSH(bitset.to_ulong() + raw_slice_idx_pre / 64,
+             ceil(alloc_slice_num, sizeof(uint64_t)));
     MM_DRAIN();
     goto finish;
+  }
+
+  do {
+    global_pool->almost_slice_free_chunk->pop_out(&new_chunk_meta);
+  } while (new_chunk_meta != nullptr && new_chunk_meta->slice_used_num == 0);
+
+  if (new_chunk_meta != nullptr) {
+    printf("reuse chunk %lu\n", new_chunk_meta->id);
+    new_chunk_meta->lock ^= 2;
+    if (theap.huge_chunk) {
+      theap.huge_chunk->owner = nullptr;
+    }
+    theap.huge_chunk = new_chunk_meta;
+    new_chunk_meta->owner = &theap;
+    goto retry;
   }
 
   rc = get_raw_chunk(&chunk_id, tBIG);
   if (rc != 0)
     return 0;
-  theap.huge_chunk->owner = nullptr;
+  if (theap.huge_chunk) {
+    theap.huge_chunk->owner = nullptr;
+  }
   theap.huge_chunk = &chunk_metas[chunk_id];
   theap.huge_chunk->owner = &theap;
-  theap.huge_chunk->huge_allocator.init(0, BLOCK_NUM_PER_CHUNK);
+  theap.huge_chunk->slice_used_num = 0;
+  theap.huge_chunk->huge_allocator.init(0, SLICE_UNIT_NUM_PER_CHUNK);
   goto retry;
 finish:
   return ret_off;
@@ -792,7 +842,7 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
         }
       } else if (chunk_meta.owner == nullptr &&
                  !(2 & chunk_meta.lock.fetch_or(2))) {
-        global_pool->almost_free_chunk->push(&chunk_metas[chunk_id]);
+        global_pool->almost_free_chunk->push(&chunk_meta);
       }
       chunk_meta.lock ^= 1;
     }
@@ -800,29 +850,36 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
     // HUGE
     off -= sizeof(size_t);
     size_t size = *(size_t *)(global_pool->layout.data + off);
-    block_id_t block_id = off / BLOCK_SIZE + 1;
-    int block_idx;
-    get_block_idx(block_id, nullptr, &block_idx);
-    uint64_t alloc_block_num = ceil(size + sizeof(size_t), BLOCK_SIZE);
-    if (chunk_meta.owner != nullptr) {
-      chunk_meta.owner->huge_chunk->huge_allocator.free(block_idx,
-                                                        alloc_block_num);
+    uint64_t raw_slice_idx_pre = off / SLICE_UNIT_SIZE;
+    uint64_t alloc_slice_num = ceil(size + sizeof(size_t), SLICE_UNIT_SIZE);
+    auto &bitset = global_pool->layout.hl->hdr_zone[chunk_id].slice_bitset;
+    for (uint64_t i = 0; i < alloc_slice_num; ++i) {
+      bitset.reset(raw_slice_idx_pre + i);
     }
-    for (uint64_t i = 0; i < alloc_block_num; ++i) {
-      chunk_meta.hdr->block_free_meta.free_block_bitset.reset(block_idx + i);
+    MM_FLUSH(bitset.to_ulong() + raw_slice_idx_pre / 64,
+             ceil(alloc_slice_num, sizeof(uint64_t)));
+    chunk_meta.huge_allocator.free(raw_slice_idx_pre, alloc_slice_num);
+    --chunk_meta.slice_used_num;
+    if (1 & chunk_meta.lock.fetch_or(1)) {
+      return;
     }
-    chunk_meta.block_used_num -= alloc_block_num;
-    if (chunk_meta.owner == nullptr && chunk_meta.block_used_num == 0) {
-      uint64_t raw_id_bit = global_pool->get_nbit_from_chunk_id(chunk_id);
-      global_pool->layout.free_chunk_bitset->reset(raw_id_bit);
-      --global_pool->chunk_used_num;
-      mm_obj_sync_nodrain(global_pool->layout.free_chunk_bitset->to_ulong() +
-                          raw_id_bit / 64);
+    if (chunk_meta.slice_used_num == 0) {
+      if (chunk_meta.owner == nullptr || chunk_meta.owner == &theap) {
+        uint64_t raw_id_bit = global_pool->get_nbit_from_chunk_id(chunk_id);
+        global_pool->layout.free_chunk_bitset->reset(raw_id_bit);
+        --global_pool->chunk_used_num;
+        mm_obj_sync_nodrain(global_pool->layout.free_chunk_bitset->to_ulong() +
+                            raw_id_bit / 64);
+      }
+      if (chunk_meta.owner == &theap) {
+        theap.huge_chunk = nullptr;
+        chunk_meta.owner = nullptr;
+      }
+    } else if (chunk_meta.owner == nullptr &&
+               !(2 & chunk_meta.lock.fetch_or(2))) {
+      global_pool->almost_slice_free_chunk->push(&chunk_meta);
     }
-    MM_FLUSH(
-        theap.huge_chunk->hdr->block_free_meta.free_block_bitset.to_ulong() +
-            block_idx / 64,
-        ceil(alloc_block_num, sizeof(uint64_t)));
+    chunk_meta.lock ^= 1;
     MM_DRAIN();
   } else {
     uint64_t alloc_chunk_num = ceil(chunk_meta.huge_size, CHUNK_SIZE);
@@ -963,24 +1020,23 @@ void mm_allocator::mm_print_stat(FILE *__restrict stream) {
       }
       break;
     case tBIG:
-      PRINTatoVtn_ref(2, cm, block_used_num, "%u");
-      PRINTtn(2, "Block bitset: ");
+      PRINTatoVtn_ref(2, cm, slice_used_num, "%u");
+      PRINTtn(2, "Slice bitset: ");
       fprintf(stream, "\t\t\t");
-      for (int j = 0; j < BLOCK_NUM_PER_CHUNK / 64; ++j) {
-        auto w = *(cm.hdr->block_free_meta.free_block_bitset.to_ulong() + j);
+      for (int j = 0; j < SLICE_UNIT_NUM_PER_CHUNK / 64; ++j) {
+        auto w =
+            *(global_pool->layout.hl->hdr_zone[i].slice_bitset.to_ulong() + j);
         fprintf(stream, "%016lx ", w);
       }
       PRINT();
       PRINT();
-      for (int j = 0; j < BLOCK_NUM_PER_CHUNK; ++j) {
-        if (!cm.hdr->block_free_meta.free_block_bitset.test(j))
+      for (int j = 0; j < SLICE_UNIT_NUM_PER_CHUNK; ++j) {
+        if (!global_pool->layout.hl->hdr_zone[i].slice_bitset.test(j))
           continue;
-        block_id_t block_id = get_block_id(i, j);
-        uint64_t size_off =
-            global_pool->layout.data_offset + (block_id - 1) * BLOCK_SIZE;
-        PRINTtn(2, "Block pre: %lu, Size: %lu", block_id,
-                *(size_t *)(global_pool->layout.data + size_off));
-        j += ceil(size_off + sizeof(size_t), BLOCK_SIZE) - 1;
+        uint64_t size_off = i * CHUNK_SIZE + j * SLICE_UNIT_SIZE;
+        size_t size = *(size_t *)(global_pool->layout.data + size_off);
+        PRINTtn(2, "Slice pre: %d, Size: %lu", j, size);
+        j += ceil(size + sizeof(size_t), SLICE_UNIT_SIZE) - 1;
       }
       break;
     case tHUGE:
