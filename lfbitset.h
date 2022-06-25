@@ -116,6 +116,35 @@ public:
     return -1;
   }
   uint64_t *to_ulong() { return (uint64_t *)bitword; }
+
+  void reset_bulk(uint64_t i, uint64_t n) {
+    uint64_t s = i / 64, e = (i + n) / 64;
+    if (s == e) {
+      if (i % 64 == 0 && n == 64)
+        bitword[s] = 0;
+      else
+        __atomic_fetch_and(&bitword[s], ~(((1UL << n) - 1UL) << (i % 64)),
+                           int(std::memory_order::memory_order_relaxed));
+    } else {
+      int h = 64 - (i % 64);
+      if (h == 64)
+        bitword[s] = 0;
+      else
+        __atomic_fetch_and(&bitword[s], ~(((1UL << h) - 1UL) << (i % 64)),
+                           int(std::memory_order::memory_order_relaxed));
+
+      for (uint64_t m = s + 1; m < e; ++m) {
+        bitword[m] = 0;
+      }
+
+      int t = (i + n) % 64;
+      if (t == 64)
+        bitword[e] = 0;
+      else
+        __atomic_fetch_and(&bitword[e], ~((1UL << t) - 1UL),
+                           int(std::memory_order::memory_order_seq_cst));
+    }
+  }
 };
 
 template <unsigned long Nbits> class lfbitset : public lfbitset_base {
@@ -207,6 +236,14 @@ public:
       }
     }
     return -1;
+  }
+
+  void reset_bulk(int i, int n) {
+    if (i == 0 && n == 64)
+      bitword = 0;
+    else
+      __atomic_fetch_and(&bitword, ~(((1UL << n) - 1UL) << i),
+                         int(std::memory_order::memory_order_relaxed));
   }
 };
 

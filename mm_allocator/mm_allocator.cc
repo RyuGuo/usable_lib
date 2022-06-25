@@ -189,7 +189,7 @@ struct seg_allocator_greater_t : public seg_allocator_t {
 struct mm_block_header {
   union {
     /**
-     * @brief size类
+     * @brief size class
      * 0 - 64B
      * 1 - 128B
      * 3 - 192B
@@ -247,6 +247,9 @@ struct layout_t {
 };
 
 struct dram_block_meta {
+  enum lock_bit_type {
+    recycle_block = 1,
+  };
   std::atomic<uint32_t> lock;
   volatile int ver;
   std::atomic<uint32_t> slab_used_num;
@@ -257,6 +260,11 @@ struct dram_chunk_meta {
   theap_s *owner;
   mm_chunk_header *hdr;
   chunk_type type;
+
+  enum lock_bit_type {
+    recycle_block = 1,
+    has_been_recycled = 2,
+  };
 
   std::atomic<uint8_t> lock;
 
@@ -396,10 +404,6 @@ void mm_allocator::env_init(void *addr, size_t max_size,
   for (uint64_t i = 0; i < chunk_num; ++i) {
     auto &hz = layout.hl->hdr_zone[i];
     hz.ch.block_free_meta.free_block_bitset.reset();
-    // for (uint64_t j = 0; j < BLOCK_NUM_PER_CHUNK; ++j) {
-    //   hz.bh[j].bitset.reset();
-    //   hz.bh[j].size_cls = -1;
-    // }
   }
   layout.data_offset = data_offset;
   layout.data = ADDR + data_offset;
@@ -570,9 +574,7 @@ static int get_raw_chunk(chunk_id_t *chunk_id, chunk_type type) {
 void free_slab_to_block(mm_block_header &mbh, uint64_t off) {
   int size_cls = mbh.size_cls;
   int slab_unit_idx = (off % BLOCK_SIZE) / SLAB_UNIT_SIZE;
-  for (int i = 0; i <= size_cls; ++i) {
-    mbh.bitset.reset(slab_unit_idx + i);
-  }
+  mbh.bitset.reset_bulk(slab_unit_idx, size_cls + 1);
   mm_obj_sync(mbh.bitset.to_ulong());
 }
 
@@ -607,7 +609,7 @@ retry:
   } while (new_chunk_meta != nullptr && new_chunk_meta->block_used_num == 0);
 
   if (new_chunk_meta != nullptr) {
-    new_chunk_meta->lock ^= 2;
+    new_chunk_meta->lock ^= dram_chunk_meta::has_been_recycled;
     theap_unload_chunk();
     theap.chunk = new_chunk_meta;
     new_chunk_meta->owner = &theap;
@@ -664,8 +666,7 @@ retry:
   } while (new_chunk_meta != nullptr && new_chunk_meta->slice_used_num == 0);
 
   if (new_chunk_meta != nullptr) {
-    printf("reuse chunk %lu\n", new_chunk_meta->id);
-    new_chunk_meta->lock ^= 2;
+    new_chunk_meta->lock ^= dram_chunk_meta::has_been_recycled;
     if (theap.huge_chunk) {
       theap.huge_chunk->owner = nullptr;
     }
@@ -783,7 +784,9 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
      *    不能加入到队列
      */
     if (bm.slab_used_num == 0) {
-      if ((1 & bm.lock.fetch_or(1)) || ver != bm.ver) {
+      if ((dram_block_meta::recycle_block &
+           bm.lock.fetch_or(dram_block_meta::recycle_block)) ||
+          ver != bm.ver) {
         return;
       }
       int size_cls = mbh.size_cls;
@@ -805,7 +808,7 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
         mm_obj_sync(free_block_bitset.to_ulong() + block_idx / 64);
       }
       ++bm.ver;
-      bm.lock ^= 1;
+      bm.lock ^= dram_block_meta::recycle_block;
       /**
        * 其他线程释放block以致chunk为空时，持有chunk权的线程毫无感知
        * 如果chunk已经从theap中踢出，则意味着这个chunk不能重用
@@ -817,7 +820,8 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
        *
        * 在判断chunk是否为空的情况，需要结合上文的bitset.reset()，情况复杂
        */
-      if (1 & chunk_meta.lock.fetch_or(1)) {
+      if (dram_chunk_meta::recycle_block &
+          chunk_meta.lock.fetch_or(dram_chunk_meta::recycle_block)) {
         return;
       }
       /**
@@ -841,10 +845,12 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
           chunk_meta.owner = nullptr;
         }
       } else if (chunk_meta.owner == nullptr &&
-                 !(2 & chunk_meta.lock.fetch_or(2))) {
+                 !(dram_chunk_meta::has_been_recycled &
+                   chunk_meta.lock.fetch_or(
+                       dram_chunk_meta::has_been_recycled))) {
         global_pool->almost_free_chunk->push(&chunk_meta);
       }
-      chunk_meta.lock ^= 1;
+      chunk_meta.lock ^= dram_chunk_meta::recycle_block;
     }
   } else if (chunk_meta.type == tBIG) {
     // HUGE
@@ -853,14 +859,13 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
     uint64_t raw_slice_idx_pre = off / SLICE_UNIT_SIZE;
     uint64_t alloc_slice_num = ceil(size + sizeof(size_t), SLICE_UNIT_SIZE);
     auto &bitset = global_pool->layout.hl->hdr_zone[chunk_id].slice_bitset;
-    for (uint64_t i = 0; i < alloc_slice_num; ++i) {
-      bitset.reset(raw_slice_idx_pre + i);
-    }
+    bitset.reset_bulk(raw_slice_idx_pre, alloc_slice_num);
     MM_FLUSH(bitset.to_ulong() + raw_slice_idx_pre / 64,
              ceil(alloc_slice_num, sizeof(uint64_t)));
     chunk_meta.huge_allocator.free(raw_slice_idx_pre, alloc_slice_num);
     --chunk_meta.slice_used_num;
-    if (1 & chunk_meta.lock.fetch_or(1)) {
+    if (dram_chunk_meta::recycle_block &
+        chunk_meta.lock.fetch_or(dram_chunk_meta::recycle_block)) {
       return;
     }
     if (chunk_meta.slice_used_num == 0) {
@@ -876,16 +881,17 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
         chunk_meta.owner = nullptr;
       }
     } else if (chunk_meta.owner == nullptr &&
-               !(2 & chunk_meta.lock.fetch_or(2))) {
+               !(dram_chunk_meta::has_been_recycled &
+                 chunk_meta.lock.fetch_or(
+                     dram_chunk_meta::has_been_recycled))) {
       global_pool->almost_slice_free_chunk->push(&chunk_meta);
     }
-    chunk_meta.lock ^= 1;
+    chunk_meta.lock ^= dram_chunk_meta::recycle_block;
     MM_DRAIN();
   } else {
     uint64_t alloc_chunk_num = ceil(chunk_meta.huge_size, CHUNK_SIZE);
-    for (uint64_t i = 0; i < alloc_chunk_num; ++i) {
-      global_pool->layout.free_chunk_bitset->reset(chunk_id + i);
-    }
+    global_pool->layout.free_chunk_bitset->reset_bulk(chunk_id,
+                                                      alloc_chunk_num);
     MM_FLUSH(global_pool->layout.free_chunk_bitset->to_ulong() + chunk_id / 64,
              ceil(alloc_chunk_num, sizeof(uint64_t)));
     MM_DRAIN();

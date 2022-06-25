@@ -62,7 +62,7 @@ public:
   hash32() : seed(0) {}
   hash32(int seed) : seed(seed) {}
 
-  uint32_t operator()(uint32_t x) { return ror32(x * 0x9e3779b1U, 24); }
+  uint32_t operator()(uint32_t x) { return seed ^ ror32(x * 0x9e3779b1U, 24); }
 
   uint32_t operator()(const void *s, uint32_t len) {
     const uint8_t *data = (const uint8_t *)s;
@@ -112,7 +112,7 @@ public:
   hash64(int seed) : seed(seed) {}
 
   uint64_t operator()(uint64_t x) {
-    return ror64(x * 0x9e3779b97f4a7c15LU, 24);
+    return seed ^ ror64(x * 0x9e3779b97f4a7c15LU, 24);
   }
 
   uint64_t operator()(const void *s, uint32_t len) {
