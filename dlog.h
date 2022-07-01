@@ -10,10 +10,10 @@
 #ifndef __DLOG_H__
 #define __DLOG_H__
 
-#include <assert.h>
+#include <cassert>
 #include <cstdlib>
 #include <ctime>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -48,13 +48,48 @@
   } while (0)
 
 #define DLOG_IF(expr, format, ...)                                             \
-  if (expr)                                                                    \
-  DLOG(format, ##__VA_ARGS__)
-
-#define DLOG_ASSERT(expr, format, ...)                                         \
   do {                                                                         \
-    if (__glibc_unlikely(expr)) {                                              \
-      DLOG_ERROR(format, ##__VA_ARGS__);                                       \
+    if (expr)                                                                  \
+      DLOG(format, ##__VA_ARGS__);                                             \
+  } while (0)
+
+inline constexpr const char *type_fmt(const char) { return "%c"; }
+inline constexpr const char *type_fmt(const short) { return "%hd"; }
+inline constexpr const char *type_fmt(const int) { return "%d"; }
+inline constexpr const char *type_fmt(const long) { return "%ld"; }
+inline constexpr const char *type_fmt(const long long) { return "%lld"; }
+inline constexpr const char *type_fmt(const unsigned char) { return "%hhu"; }
+inline constexpr const char *type_fmt(const unsigned short) { return "%hu"; }
+inline constexpr const char *type_fmt(const unsigned int) { return "%u"; }
+inline constexpr const char *type_fmt(const unsigned long) { return "%lu"; }
+inline constexpr const char *type_fmt(const unsigned long long) { return "%llu"; }
+inline constexpr const char *type_fmt(const float) { return "%f"; }
+inline constexpr const char *type_fmt(const double) { return "%lf"; }
+inline constexpr const char *type_fmt(const long double) { return "%llf"; }
+inline constexpr const char *type_fmt(const void *) { return "%p"; }
+
+/**
+ * Assert the judgment between two values.
+ * @example DLOG_EXPR(malloc(1), !=, nullptr)
+ *
+ * @warning In C++11, `NULL` will throw warning: passing NULL to non-pointer argument...
+ *          You should use `nullptr` instead of `NULL`.
+ */
+#define DLOG_EXPR(val_a, op, val_b)                                            \
+  do {                                                                         \
+     \
+    char fmt[] = "Because " #val_a " = %???, " #val_b " = %???";               \
+    char tmp[sizeof(fmt) + 42];                                                \
+    snprintf(fmt, sizeof(fmt), "Because " #val_a " = %s, " #val_b " = %s",     \
+             type_fmt(val_a), type_fmt(val_b));                                \
+    snprintf(tmp, sizeof(tmp), fmt, val_a, val_b);                             \
+    DLOG_ASSERT((val_a)op(val_b), "%s", tmp);                                  \
+  } while (0)
+
+#define DLOG_ASSERT(expr, format...)                                           \
+  do {                                                                         \
+    if (__glibc_unlikely(!(expr))) {                                           \
+      DLOG_ERROR("Assertion `" #expr "` failed. " format);                     \
       exit(1);                                                                 \
     }                                                                          \
   } while (0)
