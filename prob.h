@@ -42,7 +42,7 @@ template <typename Iter> double variance(const Iter first, const Iter last) {
   using T = typename std::remove_reference<decltype(*first)>::type;
   double avg = average(first, last);
   return average(first, last, [avg](T x, double p) {
-    double tmp = (x - avg);
+    double tmp = x - avg;
     return p + tmp * tmp;
   });
 }
@@ -69,7 +69,7 @@ double stddeviation(const Iter first, const Iter last, BinaryOperation op) {
 
 /**
  * @brief Generates random number according zipfian distribution.
- * It is defined as: P(X=k)= C / k^p, 1 <= k <= n
+ * It is defined as: P(X=k)= C / k^q, 1 <= k <= n
  */
 class zipf_distribution {
 public:
