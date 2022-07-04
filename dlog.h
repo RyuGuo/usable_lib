@@ -83,7 +83,7 @@ inline constexpr const char *type_fmt(const void *) { return "%p"; }
     snprintf(fmt, sizeof(fmt), "Because " #val_a " = %s, " #val_b " = %s",     \
              type_fmt(val_a), type_fmt(val_b));                                \
     snprintf(tmp, sizeof(tmp), fmt, val_a, val_b);                             \
-    DLOG_ASSERT((val_a)op(val_b), "%s", tmp);                                  \
+    DLOG_ASSERT((val_a) op (val_b), "%s", tmp);                                  \
   } while (0)
 
 #define DLOG_ASSERT(expr, format...)                                           \

@@ -50,12 +50,13 @@ public:
   }
 };
 
-class barrier {
+class barrier_t {
   pthread_barrier_t b;
 
 public:
-  barrier() { pthread_barrier_init(&b, nullptr, 0); }
-  ~barrier() { pthread_barrier_destroy(&b); }
+  barrier_t() { pthread_barrier_init(&b, nullptr, 0); }
+  barrier_t(unsigned int count) { pthread_barrier_init(&b, nullptr, count); }
+  ~barrier_t() { pthread_barrier_destroy(&b); }
 
   void init(unsigned int count) { pthread_barrier_init(&b, nullptr, count); }
   void wait() { pthread_barrier_wait(&b); }
