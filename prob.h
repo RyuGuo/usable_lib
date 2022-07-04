@@ -6,16 +6,6 @@
 #include <random>
 #include <vector>
 
-union double_format {
-  double d;
-  struct {
-    unsigned f1 : 32;
-    unsigned f0 : 20;
-    unsigned e : 11;
-    unsigned s : 1;
-  };
-};
-
 template <typename Iter> double summation(const Iter first, const Iter last) {
   double sum = 0;
   for (; first != last; ++first)
