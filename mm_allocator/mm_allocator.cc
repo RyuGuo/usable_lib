@@ -490,8 +490,6 @@ void env_recovery(void *addr, size_t max_size,
     }
   }
 
-  // TODO : huge_chunk_allocator, almost_free_chunk, almost_slice_free_chunk
-
   MM_FLUSH = mm_flush;
   MM_DRAIN = mm_drain;
   mm_flush(ADDR, data_offset);
