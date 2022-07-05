@@ -24,7 +24,7 @@ public:
       v_pl.push_back(p);
   }
 
-  void clear_thread_temp() {
+  void deallocate_thread_temp() {
     for (auto &e : v_pl)
       _Alloc<_Tp>::deallocate(e, 1);
   }

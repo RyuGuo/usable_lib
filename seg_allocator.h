@@ -1,6 +1,7 @@
 #ifndef __SEG_ALLOCATOR_H__
 #define __SEG_ALLOCATOR_H__
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <set>
@@ -44,6 +45,43 @@ struct seg_allocator_t {
     free_seg_set_off.erase(iter->second);
     free_seg_set_siz.erase(iter);
     lock.unlock();
+    return off;
+  }
+  uint64_t alloc_placement(uint64_t off, size_t size) {
+    lock.lock();
+    auto iter =
+        std::upper_bound(free_seg_set_off.rbegin(), free_seg_set_off.rend(),
+                         off, [](const uint64_t a, std::pair<const uint64_t, size_t> b) { return a >= b.first; });
+    if (iter == free_seg_set_off.rend()) {
+      lock.unlock();
+      return -1;
+    }
+    if (iter->first + iter->second < off + size) {
+      lock.unlock();
+      return -1;
+    }
+    size_t less = iter->second - size;
+    if (less == 0) {
+      free_seg_set_off.erase(iter->first);
+      free_seg_set_siz.erase(std::make_pair(iter->second, iter->first));
+    } else if (iter->first == off) {
+      free_seg_set_siz.erase(std::make_pair(iter->second, iter->first));
+      free_seg_set_off.erase(iter->first);
+      free_seg_set_off.insert(std::make_pair(off, less));
+      free_seg_set_siz.insert(std::make_pair(less, off));
+    } else if (iter->first + iter->second == off + size) {
+      free_seg_set_siz.erase(std::make_pair(iter->second, iter->first));
+      iter->second = less;
+      free_seg_set_siz.insert(std::make_pair(iter->second, iter->first));
+    } else {
+      free_seg_set_siz.erase(std::make_pair(iter->second, iter->first));
+      iter->second = off - iter->first;
+      free_seg_set_siz.insert(std::make_pair(iter->second, iter->first));
+      free_seg_set_off.insert(
+          std::make_pair(off + size, less - iter->second));
+      free_seg_set_siz.insert(
+          std::make_pair(less - iter->second, off + size));
+    }
     return off;
   }
   void free(uint64_t off, size_t size) {
@@ -101,6 +139,13 @@ struct seg_allocator_greater_t : public seg_allocator_t {
     if (ret == -1)
       return -1;
     return base + this->size - 1 - ret + base - size;
+  }
+  uint64_t alloc_placement(uint64_t off, size_t size) {
+    uint64_t p = base + this->size - 1 - off + base - size;
+    uint64_t ret = seg_allocator_t::alloc_placement(p, size);
+    if (ret == -1)
+      return -1;
+    return off;
   }
   void free(uint64_t off, size_t size) {
     uint64_t p = base + this->size - 1 - off + base - size;

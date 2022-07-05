@@ -70,7 +70,7 @@ struct theap_s;
  *
  * superblock: global_meta, free_chunk_bitset
  * headers: [chunk_hdr][block_hdr][block_hdr]...[block_hdr]     |
- *          [chunk_hdr][block_hdr][block_hdr]...[block_hdr]...  > N
+ *          [chunk_hdr][block_hdr][block_hdr]...[block_hdr]...  } N
  *                     |-----------------v----------------|     |
  *                                      64
  *          4KB
@@ -121,8 +121,13 @@ struct mm_chunk_header {
 
 struct mm_global_header {
   uint64_t end_offset;
-
   uint64_t chunk_total_num;
+  uint64_t actual_use;
+  uint64_t gh_offset;
+  uint64_t free_chunk_bitset_offset;
+  uint64_t free_chunk_bitword_offset;
+  uint64_t hl_offset;
+  uint64_t data_offset;
 };
 
 struct mm_hdr_layout {
@@ -291,6 +296,12 @@ void mm_allocator::env_init(void *addr, size_t max_size,
   layout.gh = reinterpret_cast<mm_global_header *>(ADDR + gh_offset);
   layout.gh->chunk_total_num = chunk_num;
   layout.gh->end_offset = max_size;
+  layout.gh->free_chunk_bitset_offset = free_chunk_bitset_offset;
+  layout.gh->free_chunk_bitword_offset = free_chunk_bitword_offset;
+  layout.gh->data_offset = data_offset;
+  layout.gh->hl_offset = hl_offset;
+  layout.gh->actual_use = actual_use;
+  layout.gh->gh_offset = gh_offset;
 
   layout.free_chunk_bitset =
       reinterpret_cast<lfbitset_base *>(ADDR + free_chunk_bitset_offset);
@@ -323,11 +334,7 @@ void mm_allocator::env_init(void *addr, size_t max_size,
     cm.hdr = &layout.hl->hdr_zone[i].ch;
     cm.owner = nullptr;
     cm.free_block = nullptr;
-    for (uint64_t j = 0; j < BLOCK_NUM_PER_CHUNK; ++j) {
-      auto &bm = block_metas[i * BLOCK_NUM_PER_CHUNK + j];
-      bm.lock = 0;
-      bm.slab_used_num = 0;
-    }
+    cm.lock = 0;
   }
 
   global_pool->chunk_used_num = 0;
@@ -345,6 +352,145 @@ void mm_allocator::env_init(void *addr, size_t max_size,
   global_pool->meta_use_memory +=
       sizeof(*global_pool->almost_slice_free_chunk) +
       global_pool->almost_slice_free_chunk->capacity() * 8;
+
+  MM_FLUSH = mm_flush;
+  MM_DRAIN = mm_drain;
+  mm_flush(ADDR, data_offset);
+  mm_drain();
+  STATUS = true;
+}
+
+void env_recovery(void *addr, size_t max_size,
+                  void (*mm_flush)(void *ptr, size_t size),
+                  void (*mm_drain)()) {
+  if (STATUS)
+    return;
+  ADDR = static_cast<char *>(addr);
+  MAX_SIZE = max_size;
+
+  global_pool = new dram_global_pool_meta();
+  if (global_pool == nullptr)
+    throw "Out of memory";
+  global_pool->meta_use_memory = sizeof(*global_pool);
+  layout_t &layout = global_pool->layout;
+
+  uint64_t chunk_num;
+  uint64_t gh_offset, free_chunk_bitset_offset, free_chunk_bitword_offset,
+      hl_offset, data_offset, actual_use;
+
+  gh_offset = 0;
+
+  layout.gh = reinterpret_cast<mm_global_header *>(ADDR + gh_offset);
+
+  chunk_num = layout.gh->chunk_total_num;
+  free_chunk_bitset_offset = layout.gh->free_chunk_bitset_offset;
+  free_chunk_bitword_offset = layout.gh->free_chunk_bitword_offset;
+  hl_offset = layout.gh->hl_offset;
+  data_offset = layout.gh->data_offset;
+  actual_use = layout.gh->actual_use;
+  if (actual_use > max_size)
+    throw "Out of memory";
+
+  layout.chunk_num = chunk_num;
+  layout.hl = reinterpret_cast<mm_hdr_layout *>(ADDR + hl_offset);
+  layout.free_chunk_bitset =
+      reinterpret_cast<lfbitset_base *>(ADDR + free_chunk_bitset_offset);
+  *layout.free_chunk_bitset = lfbitset_base(
+      reinterpret_cast<uint64_t *>(ADDR + free_chunk_bitword_offset),
+      chunk_num);
+  layout.data_offset = data_offset;
+  layout.data = ADDR + data_offset;
+
+  chunk_metas = new dram_chunk_meta[chunk_num];
+  if (chunk_metas == nullptr)
+    throw "Out of memory";
+  global_pool->meta_use_memory += sizeof(*chunk_metas) * chunk_num;
+  block_metas = new dram_block_meta[chunk_num * BLOCK_NUM_PER_CHUNK];
+  if (block_metas == nullptr)
+    throw "Out of memory";
+  global_pool->meta_use_memory +=
+      sizeof(*block_metas) * chunk_num * BLOCK_NUM_PER_CHUNK;
+
+  global_pool->huge_chunk_allocator.init(0, chunk_num);
+  global_pool->almost_free_chunk = new ConQueue<dram_chunk_meta *>(chunk_num);
+  if (global_pool->almost_free_chunk == nullptr)
+    throw "Out of memory";
+  global_pool->meta_use_memory +=
+      sizeof(*global_pool->almost_free_chunk) +
+      global_pool->almost_free_chunk->capacity() * 8;
+  global_pool->almost_slice_free_chunk =
+      new ConQueue<dram_chunk_meta *>(chunk_num);
+  if (global_pool->almost_slice_free_chunk == nullptr)
+    throw "Out of memory";
+  global_pool->meta_use_memory +=
+      sizeof(*global_pool->almost_slice_free_chunk) +
+      global_pool->almost_slice_free_chunk->capacity() * 8;
+
+  global_pool->chunk_used_num = 0;
+
+  for (uint64_t i = 0; i < chunk_num; ++i) {
+    auto &cm = chunk_metas[i];
+    cm.id = i;
+    cm.hdr = &layout.hl->hdr_zone[i].ch;
+    cm.owner = nullptr;
+    cm.lock = 0;
+
+    if (!layout.free_chunk_bitset->test(
+            global_pool->get_nbit_from_chunk_id(i))) {
+      cm.free_block = nullptr;
+    } else {
+      ++global_pool->chunk_used_num;
+      cm.type = cm.hdr->type;
+      switch (cm.type) {
+      case tSMALL:
+        for (uint64_t j = 0; j < BLOCK_NUM_PER_CHUNK; ++j) {
+          if (!cm.hdr->block_free_meta.free_block_bitset.test(j))
+            continue;
+          ++cm.block_used_num;
+          auto &bm = block_metas[i * BLOCK_NUM_PER_CHUNK + j];
+          bm.lock = 0;
+          bm.slab_used_num = __builtin_popcount(
+              *layout.hl->hdr_zone[i].bh[j].bitset.to_ulong());
+          if (bm.slab_used_num == 0) {
+            if (cm.free_block == nullptr) {
+              cm.free_block = new ConQueue<block_id_t>(BLOCK_NUM_PER_CHUNK);
+            }
+            cm.free_block->push(j + 1);
+          }
+        }
+        if (cm.block_used_num < BLOCK_NUM_PER_CHUNK) {
+          global_pool->almost_free_chunk->push(&cm);
+        }
+        break;
+      case tBIG:
+        cm.huge_allocator.init(0, SLICE_UNIT_NUM_PER_CHUNK);
+        for (uint64_t j = 0; j < SLICE_UNIT_NUM_PER_CHUNK; ++j) {
+          if (!layout.hl->hdr_zone[i].slice_bitset.test(j)) {
+            continue;
+          }
+          ++cm.slice_used_num;
+          uint64_t size_off = i * CHUNK_SIZE + j * SLICE_UNIT_SIZE;
+          size_t size = *(size_t *)(layout.data + size_off);
+          uint64_t alloc_slice_num =
+              ceil(size + sizeof(size_t), SLICE_UNIT_SIZE);
+          cm.huge_allocator.alloc_placement(j, alloc_slice_num);
+          j += alloc_slice_num - 1;
+        }
+        if (cm.huge_allocator.has_free_seg(SLAB_UNIT_SIZE * SIZE_CLASS_NUM +
+                                           1)) {
+          global_pool->almost_slice_free_chunk->push(&cm);
+        }
+        break;
+      case tHUGE: {
+        uint64_t alloc_chunk_num = ceil(cm.hdr->huge_size, CHUNK_SIZE);
+        global_pool->huge_chunk_allocator.alloc_placement(i, alloc_chunk_num);
+        i += alloc_chunk_num - 1;
+      } break;
+      }
+    }
+  }
+
+  // TODO : huge_chunk_allocator, almost_free_chunk, almost_slice_free_chunk
 
   MM_FLUSH = mm_flush;
   MM_DRAIN = mm_drain;
@@ -408,7 +554,9 @@ static block_id_t alloc_block_from_chunk(int size_cls) {
   auto &mbh = global_pool->get_mm_block_header(block_id);
   mbh.size_cls = size_cls;
   mbh.bitset.reset();
-  block_metas[block_id - 1].slab_used_num = 0;
+  auto &bm = block_metas[block_id - 1];
+  bm.slab_used_num = 0;
+  bm.lock = 0;
   mm_obj_sync_nodrain(&mbh);
   mm_obj_sync_nodrain(bitset.to_ulong() + block_idx / 64);
   MM_DRAIN();
@@ -592,7 +740,7 @@ finish:
 
 static uint64_t huge_alloc_multi_chunk(size_t size) {
   std::vector<chunk_id_t> junk;
-  uint64_t alloc_chunk_num = ceil(size + sizeof(size_t), CHUNK_SIZE);
+  uint64_t alloc_chunk_num = ceil(size, CHUNK_SIZE);
 retry:
   chunk_id_t chunk_id_pre =
       global_pool->huge_chunk_allocator.alloc(alloc_chunk_num);
@@ -879,7 +1027,7 @@ void mm_allocator::mm_print_stat(FILE *__restrict stream) {
   PRINT();
   PRINT();
 
-  for (uint64_t i = 0; i < global_pool->chunk_used_num; ++i) {
+  for (uint64_t i = 0; i < global_pool->layout.chunk_num; ++i) {
     if (!global_pool->layout.free_chunk_bitset->test(
             global_pool->get_nbit_from_chunk_id(i)))
       continue;

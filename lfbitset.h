@@ -18,7 +18,7 @@ public:
       : widx(0), _Nbits(Nbits), align_N((Nbits + 63) / 64), self_alloc(true) {
     bitword = new uint64_t[align_N];
     if (bitword == nullptr)
-      throw "Out of memory";
+      throw "Out of Memory";
     reset();
   }
   lfbitset_base(volatile uint64_t *bitword, uint64_t Nbits)
