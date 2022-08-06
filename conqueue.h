@@ -179,6 +179,8 @@ public:
         c = std::min(count, h_ - _t);
       } while (!t.compare_exchange_weak(
           _t, c + _t, std::memory_order::memory_order_relaxed));
+      if (c == 0)
+        return 0;
       while (c != 0) {
         if (v) {
           v[l] = ring[to_id(_t + l)];

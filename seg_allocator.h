@@ -18,22 +18,20 @@ struct seg_allocator_t {
   size_t size;
 
   void init(uint64_t base, size_t size) {
-    lock.lock();
+    std::unique_lock<std::mutex> lck(lock);
     free_seg_set_siz.clear();
     free_seg_set_off.clear();
     free_seg_set_siz.insert(std::make_pair(size, base));
     free_seg_set_off.insert(std::make_pair(base, size));
-    lock.unlock();
   }
   bool has_free_seg(size_t size) {
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     return iter != free_seg_set_siz.end();
   }
   uint64_t alloc(size_t size) {
-    lock.lock();
+    std::unique_lock<std::mutex> lck(lock);
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     if (iter == free_seg_set_siz.end()) {
-      lock.unlock();
       return -1;
     }
     uint64_t off = iter->second;
@@ -44,20 +42,19 @@ struct seg_allocator_t {
     }
     free_seg_set_off.erase(iter->second);
     free_seg_set_siz.erase(iter);
-    lock.unlock();
     return off;
   }
   uint64_t alloc_placement(uint64_t off, size_t size) {
-    lock.lock();
-    auto iter =
-        std::upper_bound(free_seg_set_off.rbegin(), free_seg_set_off.rend(),
-                         off, [](const uint64_t a, std::pair<const uint64_t, size_t> b) { return a >= b.first; });
+    std::unique_lock<std::mutex> lck(lock);
+    auto iter = std::upper_bound(
+        free_seg_set_off.rbegin(), free_seg_set_off.rend(), off,
+        [](const uint64_t a, std::pair<const uint64_t, size_t> b) {
+          return a >= b.first;
+        });
     if (iter == free_seg_set_off.rend()) {
-      lock.unlock();
       return -1;
     }
     if (iter->first + iter->second < off + size) {
-      lock.unlock();
       return -1;
     }
     size_t less = iter->second - size;
@@ -77,15 +74,13 @@ struct seg_allocator_t {
       free_seg_set_siz.erase(std::make_pair(iter->second, iter->first));
       iter->second = off - iter->first;
       free_seg_set_siz.insert(std::make_pair(iter->second, iter->first));
-      free_seg_set_off.insert(
-          std::make_pair(off + size, less - iter->second));
-      free_seg_set_siz.insert(
-          std::make_pair(less - iter->second, off + size));
+      free_seg_set_off.insert(std::make_pair(off + size, less - iter->second));
+      free_seg_set_siz.insert(std::make_pair(less - iter->second, off + size));
     }
     return off;
   }
   void free(uint64_t off, size_t size) {
-    lock.lock();
+    std::unique_lock<std::mutex> lck(lock);
     auto next = free_seg_set_off.lower_bound(off);
     int flag = 0;
     // check if merge next seg
@@ -125,7 +120,6 @@ struct seg_allocator_t {
       free_seg_set_siz.insert(std::make_pair(next->second, next->first));
       break;
     }
-    lock.unlock();
   }
 };
 struct seg_allocator_greater_t : public seg_allocator_t {
