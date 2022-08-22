@@ -128,11 +128,19 @@ private:
     }
 
     leader_handle(uint32_t max_count) : uid_map(max_count * 3 / 2) {
+      uid_queue = new UID_t[max_count];
+      task_queue = static_cast<T *>(::operator new(sizeof(T) * max_count));
       fu_queue = new future_handle *[max_count];
     }
-    ~leader_handle() { delete[] fu_queue; }
+    ~leader_handle() {
+      delete[] uid_queue;
+      delete[] task_queue;
+      delete[] fu_queue;
+    }
 
     std::unordered_map<UID_t, uint32_t> uid_map;
+    UID_t *uid_queue;
+    T *task_queue;
     future_handle **fu_queue;
     char uctx_buf[sizeof(CTX_t)];
   };
@@ -205,13 +213,9 @@ public:
    */
   TCQueue(uint32_t max_count, uint32_t wait_us)
       : max_count(max_count), wait_us(wait_us), queue_valid(false) {
-    uid_queue = new UID_t[max_count];
-    task_queue = static_cast<T *>(::operator new(sizeof(T) * max_count));
     free_fh.reserve(max_count);
   }
   ~TCQueue() {
-    delete[] uid_queue;
-    delete[] task_queue;
     for (auto &fh : free_fh) {
       delete fh;
     }
@@ -236,6 +240,8 @@ public:
       queue_cnt_ = 0;
       queue_cnt = 0;
       fu_queue = lh->fu_queue;
+      uid_queue = lh->uid_queue;
+      task_queue = lh->task_queue;
       ++queue_ver;
 
       uint32_t idx = enqueue_ready();
@@ -265,15 +271,15 @@ public:
       wlck.unwrlock();
 
       uint32_t len = queue_cnt;
+      en_lck.unlock();
+
       new (lh->uctx_buf)
-          CTX_t(hook_batch_collection(uid_queue, task_queue, len));
+          CTX_t(hook_batch_collection(lh->uid_queue, task_queue, len));
 
       // Mapping UIDs to tasks.
       for (uint32_t i = 0; i < len; ++i) {
-        lh->uid_map.insert(std::make_pair(uid_queue[i], i));
+        lh->uid_map.insert(std::make_pair(lh->uid_queue[i], i));
       }
-
-      en_lck.unlock();
     } else {
       // The purpose of double-locking is to prevent access to the queue from
       // continuing even after the queue has failed.
