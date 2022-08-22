@@ -2,10 +2,10 @@
 #define __TCQ_H__
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
-#include <sys/time.h>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -154,9 +154,9 @@ private:
   void enqueue_confirm() { ++queue_cnt; }
 
   uint64_t gettime() {
-    timeval tv;
-    gettimeofday(&tv, nullptr);
-    return tv.tv_sec * 1000000 + tv.tv_usec;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
   }
 
   future_handle *alloc_future_handle() {
@@ -207,6 +207,7 @@ public:
       : max_count(max_count), wait_us(wait_us), queue_valid(false) {
     uid_queue = new UID_t[max_count];
     task_queue = static_cast<T *>(::operator new(sizeof(T) * max_count));
+    free_fh.reserve(max_count);
   }
   ~TCQueue() {
     delete[] uid_queue;
@@ -319,7 +320,7 @@ public:
       hook_batch_collection;
   // Get the mapping of UID to the return value of a task. For example, recv()
   // and parsing.
-  std::function<std::vector<std::pair<UID_t, R>>(CTX_t ctx, uint32_t need_len)>
+  std::function<std::vector<std::pair<UID_t, R>>(CTX_t &ctx, uint32_t need_len)>
       hook_batch_ret_collection;
 
 private:
