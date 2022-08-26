@@ -80,19 +80,19 @@ public:
   bool set(uint64_t __i) {
     uint64_t pre =
         __atomic_fetch_or(&bitword[__i / 64], 1L << (__i % 64),
-                          int(std::memory_order::memory_order_relaxed));
+                          __ATOMIC_RELAXED);
     return pre & (1L << (__i % 64));
   }
   bool reset(uint64_t __i) {
     uint64_t pre =
         __atomic_fetch_and(&bitword[__i / 64], ~(1L << (__i % 64)),
-                           int(std::memory_order::memory_order_relaxed));
+                           __ATOMIC_RELAXED);
     return pre & (1L << (__i % 64));
   }
   bool flip(uint64_t __i) {
     uint64_t pre =
         __atomic_fetch_xor(&bitword[__i / 64], 1L << (__i % 64),
-                           int(std::memory_order::memory_order_relaxed));
+                           __ATOMIC_RELAXED);
     return pre & (1L << (__i % 64));
   }
   uint64_t ffs_and_set() {
@@ -106,8 +106,8 @@ public:
         }
         if (__atomic_compare_exchange_n(
                 &bitword[widx], &w, w | (1L << (idx - 1)), true,
-                int(std::memory_order::memory_order_seq_cst),
-                int(std::memory_order::memory_order_seq_cst))) {
+                __ATOMIC_SEQ_CST,
+                __ATOMIC_SEQ_CST)) {
           this->widx = widx + 8;
           return widx * 64 + idx - 1;
         }
@@ -124,14 +124,14 @@ public:
         bitword[s] = 0;
       else
         __atomic_fetch_and(&bitword[s], ~(((1UL << n) - 1UL) << (i % 64)),
-                           int(std::memory_order::memory_order_relaxed));
+                           __ATOMIC_RELAXED);
     } else {
       int h = 64 - (i % 64);
       if (h == 64)
         bitword[s] = 0;
       else
         __atomic_fetch_and(&bitword[s], ~(((1UL << h) - 1UL) << (i % 64)),
-                           int(std::memory_order::memory_order_relaxed));
+                           __ATOMIC_RELAXED);
 
       for (uint64_t m = s + 1; m < e; ++m) {
         bitword[m] = 0;
@@ -142,7 +142,7 @@ public:
         bitword[e] = 0;
       else
         __atomic_fetch_and(&bitword[e], ~((1UL << t) - 1UL),
-                           int(std::memory_order::memory_order_seq_cst));
+                           __ATOMIC_SEQ_CST);
     }
   }
 };
@@ -171,24 +171,24 @@ public:
   bool any() const { return bitword != 0; }
   bool nany() const { return ~bitword != 0; }
   bool all() const { return ~bitword == 0; }
-  bool test(uint64_t __i) const { return bitword & (1L << (__i % 64)); }
+  bool test(uint64_t __i) const { return bitword & (1L << __i); }
   bool set(uint64_t __i) {
     uint64_t pre =
-        __atomic_fetch_or(&bitword, 1L << (__i % 64),
-                          int(std::memory_order::memory_order_relaxed));
-    return pre & (1L << (__i % 64));
+        __atomic_fetch_or(&bitword, 1L << __i,
+                          __ATOMIC_RELAXED);
+    return pre & (1L << __i);
   }
   bool reset(uint64_t __i) {
     uint64_t pre =
-        __atomic_fetch_and(&bitword, ~(1L << (__i % 64)),
-                           int(std::memory_order::memory_order_relaxed));
-    return pre & (1L << (__i % 64));
+        __atomic_fetch_and(&bitword, ~(1L << __i),
+                           __ATOMIC_RELAXED);
+    return pre & (1L << __i);
   }
   bool flip(uint64_t __i) {
     uint64_t pre =
-        __atomic_fetch_xor(&bitword, 1L << (__i % 64),
-                           int(std::memory_order::memory_order_relaxed));
-    return pre & (1L << (__i % 64));
+        __atomic_fetch_xor(&bitword, 1L << __i,
+                           __ATOMIC_RELAXED);
+    return pre & (1L << __i);
   }
   uint64_t ffs_and_set() {
     uint64_t idx;
@@ -200,8 +200,8 @@ public:
       }
       if (__atomic_compare_exchange_n(
               &bitword, &w, w | (1L << (idx - 1)), true,
-              int(std::memory_order::memory_order_seq_cst),
-              int(std::memory_order::memory_order_seq_cst))) {
+              __ATOMIC_SEQ_CST,
+              __ATOMIC_SEQ_CST)) {
         return idx - 1;
       }
     }
@@ -228,8 +228,8 @@ public:
         return -1;
       } else if (__atomic_compare_exchange_n(
                      &bitword, &w, w | (mask << (idx + first_0 - 1)), true,
-                     int(std::memory_order::memory_order_seq_cst),
-                     int(std::memory_order::memory_order_seq_cst))) {
+                     __ATOMIC_SEQ_CST,
+                     __ATOMIC_SEQ_CST)) {
         return idx + first_0 - 1;
       } else {
         idx = 0;
@@ -243,7 +243,7 @@ public:
       bitword = 0;
     else
       __atomic_fetch_and(&bitword, ~(((1UL << n) - 1UL) << i),
-                         int(std::memory_order::memory_order_relaxed));
+                         __ATOMIC_RELAXED);
   }
 };
 
