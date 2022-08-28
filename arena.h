@@ -116,9 +116,6 @@ public:
     if (ptr > memory_base() + nbytes || ptr < memory_base())
       throw std::out_of_range("out of range");
 
-    auto &m_bid = thread_data::get_instance().m_bid;
-    auto &m_pos = thread_data::get_instance().m_pos;
-
     uint32_t bid = get_ptr_to_bid(ptr);
     Block &m_base = blocks[bid];
     std::unique_lock<spin_mutex_u8> b_lock(lcks[bid]);
@@ -126,7 +123,7 @@ public:
     if (!m_base.allocing && cur_ref == 0) {
       b_lock.unlock();
       std::unique_lock<spin_mutex_u8> q_lock(m_lck);
-      free_block_queue.push_front(m_bid);
+      free_block_queue.push_front(bid);
     }
   }
 
