@@ -1,5 +1,5 @@
-#ifndef __PROB_H__
-#define __PROB_H__
+#ifndef __STATISTIC_H__
+#define __STATISTIC_H__
 
 #include <cmath>
 #include <cstdint>
@@ -94,4 +94,4 @@ private:
   std::discrete_distribution<uint32_t> _dist;
 };
 
-#endif // __PROB_H__
+#endif // __STATISTIC_H__

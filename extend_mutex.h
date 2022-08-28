@@ -10,6 +10,7 @@
 #ifndef __EXTEND_MUTEX_H__
 #define __EXTEND_MUTEX_H__
 
+#include <atomic>
 #include <pthread.h>
 #include <thread>
 
@@ -62,48 +63,54 @@ public:
   void wait() { pthread_barrier_wait(&b); }
 };
 
-class spin_mutex_64 {
+class spin_mutex_u64 {
 public:
-  spin_mutex_64() : l(0) {}
+  spin_mutex_u64() : l(0) {}
 
   void lock(uint8_t i) {
     while (1) {
-      uint64_t _l = __atomic_fetch_or(&l, 1UL << i, __ATOMIC_SEQ_CST);
+      uint64_t _l = l.fetch_or(1UL << i, std::memory_order_acquire);
       if ((_l & (1UL << i)) == 0)
         break;
       std::this_thread::yield();
     }
   }
+  void lock() { lock(0); }
   bool try_lock(uint8_t i) {
-    uint64_t _l = __atomic_fetch_or(&l, 1UL << i, __ATOMIC_SEQ_CST);
+    uint64_t _l = l.fetch_or(1UL << i, std::memory_order_acquire);
     return (_l & (1UL << i)) == 0;
   }
-  void unlock(uint8_t i) { __atomic_fetch_xor(&l, 1UL << i, __ATOMIC_SEQ_CST); }
+  bool try_lock() { return try_lock(0); }
+  void unlock(uint8_t i) { l.fetch_xor(1UL << i, std::memory_order_release); }
+  void unlock() { unlock(0); }
 
 private:
-  uint64_t l;
+  std::atomic<uint64_t> l;
 };
 
-class spin_mutex_8 {
+class spin_mutex_u8 {
 public:
-  spin_mutex_8() : l(0) {}
+  spin_mutex_u8() : l(0) {}
 
   void lock(uint8_t i) {
     while (1) {
-      uint8_t _l = __atomic_fetch_or(&l, 1 << i, __ATOMIC_SEQ_CST);
+      uint8_t _l = l.fetch_or(1U << i, std::memory_order_acquire);
       if ((_l & (1 << i)) == 0)
         break;
       std::this_thread::yield();
     }
   }
+  void lock() { lock(0); }
   bool try_lock(uint8_t i) {
-    uint8_t _l = __atomic_fetch_or(&l, 1U << i, __ATOMIC_SEQ_CST);
+    uint8_t _l = l.fetch_or(1U << i, std::memory_order_acquire);
     return (_l & (1U << i)) == 0;
   }
-  void unlock(uint8_t i) { __atomic_fetch_xor(&l, 1U << i, __ATOMIC_SEQ_CST); }
+  bool try_lock() { return try_lock(0); }
+  void unlock(uint8_t i) { l.fetch_xor(1U << i, std::memory_order_release); }
+  void unlock() { unlock(0); }
 
 private:
-  uint8_t l;
+  std::atomic<uint8_t> l;
 };
 
 class shared_mutex_u8 {
@@ -112,43 +119,35 @@ public:
 
   void lock() {
     uint8_t _l = 0;
-    while (!__atomic_compare_exchange_n(&l, &_l, 1, true, __ATOMIC_SEQ_CST,
-                                        __ATOMIC_SEQ_CST)) {
+    while (!l.compare_exchange_weak(_l, 1, std::memory_order_acquire)) {
       _l = 0;
       std::this_thread::yield();
     }
   }
   void lock_shared() {
-    uint8_t _l = __atomic_fetch_add(&l, 2, __ATOMIC_SEQ_CST);
+    uint8_t _l = l.fetch_add(2, std::memory_order_acquire);
     while (_l & 1) {
       std::this_thread::yield();
-      _l = __atomic_load_n(&l, __ATOMIC_SEQ_CST);
+      _l = l.load(std::memory_order_acquire);
     }
   }
   bool try_lock() {
     uint8_t _l = 0;
-    return __atomic_compare_exchange_n(&l, &_l, 1, true, __ATOMIC_SEQ_CST,
-                                       __ATOMIC_SEQ_CST);
+    return l.compare_exchange_weak(_l, 1, std::memory_order_acquire);
   }
   bool try_lock_shared() {
-    uint8_t _l = __atomic_fetch_add(&l, 2, __ATOMIC_SEQ_CST);
+    uint8_t _l = l.fetch_add(2, std::memory_order_release);
     if (_l & 1) {
-      __atomic_fetch_sub(&l, 2, __ATOMIC_SEQ_CST);
+      l.fetch_sub(2, std::memory_order_release);
       return false;
     }
     return true;
   }
-  void unlock() {
-    uint8_t _l = __atomic_load_n(&l, __ATOMIC_SEQ_CST);
-    if (_l & 1) {
-      __atomic_xor_fetch(&l, 1, __ATOMIC_SEQ_CST);
-    } else {
-      __atomic_fetch_sub(&l, 2, __ATOMIC_SEQ_CST);
-    }
-  }
+  void unlock() { l.fetch_xor(1, std::memory_order_release); }
+  void unlock_shared() { l.fetch_sub(2, std::memory_order_release); }
 
 private:
-  uint8_t l;
+  std::atomic<uint8_t> l;
 };
 
 #endif // __EXTEND_MUTEX_H__

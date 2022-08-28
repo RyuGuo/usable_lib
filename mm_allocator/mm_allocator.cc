@@ -173,7 +173,7 @@ struct dram_chunk_meta {
 
   std::atomic<uint8_t> lock;
 
-  seg_allocator_t huge_allocator;
+  SegAllocator huge_allocator;
 
   union {
     ConQueue<block_id_t> *free_block;
@@ -192,7 +192,7 @@ struct dram_global_pool_meta {
 
   ConQueue<dram_chunk_meta *> *almost_free_chunk;
   ConQueue<dram_chunk_meta *> *almost_slice_free_chunk;
-  seg_allocator_greater_t huge_chunk_allocator;
+  SegAllocatorGreater huge_chunk_allocator;
 
   mm_block_header &get_mm_block_header(block_id_t block_id) {
     chunk_id_t chunk_id;
@@ -473,7 +473,7 @@ void env_recovery(void *addr, size_t max_size,
           size_t size = *(size_t *)(layout.data + size_off);
           uint64_t alloc_slice_num =
               ceil(size + sizeof(size_t), SLICE_UNIT_SIZE);
-          cm.huge_allocator.alloc_placement(j, alloc_slice_num);
+          cm.huge_allocator.placement_allocate(j, alloc_slice_num);
           j += alloc_slice_num - 1;
         }
         if (cm.huge_allocator.has_free_seg(SLAB_UNIT_SIZE * SIZE_CLASS_NUM +
@@ -483,7 +483,7 @@ void env_recovery(void *addr, size_t max_size,
         break;
       case tHUGE: {
         uint64_t alloc_chunk_num = ceil(cm.hdr->huge_size, CHUNK_SIZE);
-        global_pool->huge_chunk_allocator.alloc_placement(i, alloc_chunk_num);
+        global_pool->huge_chunk_allocator.placement_allocate(i, alloc_chunk_num);
         i += alloc_chunk_num - 1;
       } break;
       }
@@ -691,7 +691,7 @@ retry:
     chunk_id = theap.huge_chunk->id;
     dram_chunk_meta &chunk_meta = chunk_metas[chunk_id];
     uint64_t raw_slice_idx_pre =
-        theap.huge_chunk->huge_allocator.alloc(alloc_slice_num);
+        theap.huge_chunk->huge_allocator.allocate(alloc_slice_num);
     auto &bitset = global_pool->layout.hl->hdr_zone[chunk_id].slice_bitset;
     for (uint64_t i = 0; i < alloc_slice_num; ++i) {
       bitset.set(raw_slice_idx_pre + i);
@@ -741,7 +741,7 @@ static uint64_t huge_alloc_multi_chunk(size_t size) {
   uint64_t alloc_chunk_num = ceil(size, CHUNK_SIZE);
 retry:
   chunk_id_t chunk_id_pre =
-      global_pool->huge_chunk_allocator.alloc(alloc_chunk_num);
+      global_pool->huge_chunk_allocator.allocate(alloc_chunk_num);
   if (chunk_id_pre == -1)
     return 0;
   for (uint64_t i = 0; i < alloc_chunk_num; ++i) {
@@ -761,7 +761,7 @@ retry:
   uint64_t ret_off =
       global_pool->layout.data_offset + chunk_id_pre * CHUNK_SIZE;
   for (chunk_id_t c : junk) {
-    global_pool->huge_chunk_allocator.free(c, alloc_chunk_num);
+    global_pool->huge_chunk_allocator.deallocate(c, alloc_chunk_num);
   }
   chunk_meta.hdr->type = tHUGE;
   chunk_meta.hdr->huge_size = size;
@@ -908,7 +908,7 @@ void mm_allocator::mm_free(mm_allocator::mm_ptr<void> __ptr) {
     bitset.reset_bulk(raw_slice_idx_pre, alloc_slice_num);
     MM_FLUSH(bitset.to_ulong() + raw_slice_idx_pre / 64,
              ceil(alloc_slice_num, sizeof(uint64_t)));
-    chunk_meta.huge_allocator.free(raw_slice_idx_pre, alloc_slice_num);
+    chunk_meta.huge_allocator.deallocate(raw_slice_idx_pre, alloc_slice_num);
     --chunk_meta.slice_used_num;
     if (dram_chunk_meta::recycle_block &
         chunk_meta.lock.fetch_or(dram_chunk_meta::recycle_block)) {

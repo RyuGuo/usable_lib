@@ -6,11 +6,7 @@
 #include <mutex>
 #include <set>
 
-struct seg_allocator_t {
-  /**
-   * @brief 区间集合
-   * <size, offset>
-   */
+struct SegAllocator {
   std::mutex lock;
   std::set<std::pair<size_t, uint64_t>> free_seg_set_siz;
   std::map<uint64_t, size_t> free_seg_set_off;
@@ -28,7 +24,7 @@ struct seg_allocator_t {
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     return iter != free_seg_set_siz.end();
   }
-  uint64_t alloc(size_t size) {
+  uint64_t allocate(size_t size) {
     std::unique_lock<std::mutex> lck(lock);
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     if (iter == free_seg_set_siz.end()) {
@@ -44,7 +40,7 @@ struct seg_allocator_t {
     free_seg_set_siz.erase(iter);
     return off;
   }
-  uint64_t alloc_placement(uint64_t off, size_t size) {
+  uint64_t placement_allocate(uint64_t off, size_t size) {
     std::unique_lock<std::mutex> lck(lock);
     auto iter = std::upper_bound(
         free_seg_set_off.rbegin(), free_seg_set_off.rend(), off,
@@ -79,7 +75,7 @@ struct seg_allocator_t {
     }
     return off;
   }
-  void free(uint64_t off, size_t size) {
+  void deallocate(uint64_t off, size_t size) {
     std::unique_lock<std::mutex> lck(lock);
     auto next = free_seg_set_off.lower_bound(off);
     int flag = 0;
@@ -122,28 +118,28 @@ struct seg_allocator_t {
     }
   }
 };
-struct seg_allocator_greater_t : public seg_allocator_t {
+struct SegAllocatorGreater : public SegAllocator {
   void init(uint64_t base, size_t size) {
     this->base = base;
     this->size = size;
-    seg_allocator_t::init(base, size);
+    SegAllocator::init(base, size);
   }
-  uint64_t alloc(size_t size) {
-    uint64_t ret = seg_allocator_t::alloc(size);
+  uint64_t allocate(size_t size) {
+    uint64_t ret = SegAllocator::allocate(size);
     if (ret == -1)
       return -1;
     return base + this->size - 1 - ret + base - size;
   }
-  uint64_t alloc_placement(uint64_t off, size_t size) {
+  uint64_t placement_allocate(uint64_t off, size_t size) {
     uint64_t p = base + this->size - 1 - off + base - size;
-    uint64_t ret = seg_allocator_t::alloc_placement(p, size);
+    uint64_t ret = SegAllocator::placement_allocate(p, size);
     if (ret == -1)
       return -1;
     return off;
   }
-  void free(uint64_t off, size_t size) {
+  void deallocate(uint64_t off, size_t size) {
     uint64_t p = base + this->size - 1 - off + base - size;
-    seg_allocator_t::free(p, size);
+    SegAllocator::deallocate(p, size);
   }
 };
 
