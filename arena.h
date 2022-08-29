@@ -6,6 +6,7 @@
 #include <deque>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 class Arena {
@@ -16,13 +17,20 @@ private:
     char *base;
   };
 
-  struct thread_data {
+  struct block_cursor_t {
     uint32_t m_bid = -1U;
     size_t m_pos = -1U;
+  };
+  struct thread_data {
+    std::unordered_map<const Arena *, block_cursor_t> m_map_;
 
-    static thread_data &get_instance() {
-      static thread_local thread_data tdata;
-      return tdata;
+    static block_cursor_t &get_instance(const Arena *arena) {
+      static thread_data tdata;
+      auto it = tdata.m_map_.find(arena);
+      if (it == tdata.m_map_.end()) {
+        it = tdata.m_map_.emplace(arena, block_cursor_t()).first;
+      }
+      return it->second;
     }
   };
 
@@ -83,8 +91,8 @@ public:
   }
 
   char *allocate(size_t bytes) {
-    auto &m_bid = thread_data::get_instance().m_bid;
-    auto &m_pos = thread_data::get_instance().m_pos;
+    auto &m_bid = thread_data::get_instance(this).m_bid;
+    auto &m_pos = thread_data::get_instance(this).m_pos;
 
     char *ptr;
     if (m_pos + bytes > block_size || m_pos == -1UL) {

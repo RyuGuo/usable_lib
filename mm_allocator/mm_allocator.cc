@@ -536,7 +536,7 @@ static block_id_t alloc_block_from_chunk(int size_cls) {
   int block_idx;
   dram_chunk_meta *chunk_meta = theap.chunk;
   auto &bitset = chunk_meta->hdr->block_free_meta.free_block_bitset;
-  chunk_meta->free_block->pop_out(&block_id);
+  chunk_meta->free_block->pop(&block_id);
   if (block_id == 0) {
     block_idx = bitset.ffs_and_set();
     if (block_idx == -1) {
@@ -651,7 +651,7 @@ retry:
   }
 
   do {
-    global_pool->almost_free_chunk->pop_out(&new_chunk_meta);
+    global_pool->almost_free_chunk->pop(&new_chunk_meta);
   } while (new_chunk_meta != nullptr && new_chunk_meta->block_used_num == 0);
 
   if (new_chunk_meta != nullptr) {
@@ -708,7 +708,7 @@ retry:
   }
 
   do {
-    global_pool->almost_slice_free_chunk->pop_out(&new_chunk_meta);
+    global_pool->almost_slice_free_chunk->pop(&new_chunk_meta);
   } while (new_chunk_meta != nullptr && new_chunk_meta->slice_used_num == 0);
 
   if (new_chunk_meta != nullptr) {

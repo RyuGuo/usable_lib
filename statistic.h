@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 template <typename Iter> double summation(const Iter first, const Iter last) {
@@ -92,6 +93,67 @@ private:
   uint32_t _n;
   double _q;
   std::discrete_distribution<uint32_t> _dist;
+};
+
+class Histogram {
+public:
+  Histogram(double min_, double max_, double interval = 10000)
+      : min_(min_), max_(max_), interval(interval), count(0) {
+    uint32_t count = (max_ - min_) / interval + 1;
+    hist.assign(count, 0);
+  }
+
+  void clear() {
+    uint32_t count = (max_ - min_) / interval + 1;
+    hist.assign(count, 0);
+    count = 0;
+  }
+
+  const std::vector<uint64_t> &get_hist() { return hist; }
+
+  void add_sample(double d) {
+    if (d < min_ || d > max_)
+      throw std::out_of_range("out of range");
+    uint32_t which_b = (d - min_) / interval;
+    ++hist[which_b];
+    ++count;
+  }
+
+  double percentage(double p) {
+    uint64_t pd = 0;
+    uint32_t left_border = 0, right_border = hist.size();
+    for (uint32_t i = 0; i < hist.size(); ++i) {
+      pd += hist[i];
+      double tmp = 1.0 * pd / count;
+      if (tmp <= p) {
+        left_border = i;
+      }
+      if (tmp >= p) {
+        right_border = i;
+        break;
+      }
+    }
+    return right_border * interval + min_;
+  }
+
+  static Histogram merge(Histogram &h1, Histogram &h2) {
+    Histogram nh(std::min(h1.min_, h2.min_), std::max(h1.max_, h2.max_),
+                 std::min(h1.interval, h2.interval));
+    for (uint32_t i = 0; i < h1.get_hist().size(); ++i)
+      for (uint64_t j = 0; j < h1.get_hist()[i]; ++j)
+        nh.add_sample((i + 0.5) * h1.interval + h1.min_);
+    for (uint32_t i = 0; i < h2.get_hist().size(); ++i)
+      for (uint64_t j = 0; j < h2.get_hist()[i]; ++j)
+        nh.add_sample((i + 0.5) * h2.interval + h2.min_);
+    return nh;
+  }
+
+private:
+  double min_;
+  double max_;
+  double interval;
+  uint64_t count;
+  std::vector<uint64_t> hist;
 };
 
 #endif // __STATISTIC_H__

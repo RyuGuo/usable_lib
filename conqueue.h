@@ -26,207 +26,325 @@ template <typename T, typename Alloc = std::allocator<T>> class ConQueue {
 public:
   ConQueue(T *ring, uint32_t max_size,
            uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                            ConQueueMode::F_MC_HTS_DEQ |
-                            ConQueueMode::F_EXACT_SZ)
-      : ring(ring), flags(flags), h(0), h_(0), t(0), t_(0), _max_size(max_size),
-        self_alloc(false) {
+                            ConQueueMode::F_MC_HTS_DEQ)
+      : ring(ring), flags(flags), _max_size(max_size), self_alloc(false) {
+    prod_head.raw = prod_tail.raw = cons_head.raw = cons_tail.raw = 0;
+
     if (ring == nullptr)
       throw "ring array is null";
     if (max_size == 0)
       throw "max_size is 0";
-    if ((flags & F_SP_ENQ) &&
-        ((flags & F_MP_RTS_ENQ) || (flags & F_MP_HTS_ENQ)))
+    if ((flags & F_SP_ENQ) && (flags & (F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
       throw "queue producer flag error";
-    if ((flags & F_SC_DEQ) &&
-        ((flags & F_MC_RTS_DEQ) || (flags & F_MC_HTS_DEQ)))
+    if ((flags & F_MP_RTS_ENQ) && (flags & F_MP_HTS_ENQ))
+      throw "queue producer flag error";
+    if ((flags & F_SC_DEQ) && (flags & (F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
       throw "queue consumer flag error";
-    if ((flags & ConQueueMode::F_EXACT_SZ) == false) {
-      max_size |= max_size >> 1;
-      max_size |= max_size >> 2;
-      max_size |= max_size >> 4;
-      max_size |= max_size >> 8;
-      max_size |= max_size >> 16;
-    }
-    count = max_size;
+    if ((flags & F_MC_RTS_DEQ) && (flags & F_MC_HTS_DEQ))
+      throw "queue consumer flag error";
+
+    // default flag set
+    if (!(flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
+      flags |= F_MP_HTS_ENQ;
+    if (!(flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
+      flags |= F_MC_HTS_DEQ;
+
+    count_mask = aligned_size(max_size, flags) - 1;
   }
   ConQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                                               ConQueueMode::F_MC_HTS_DEQ |
-                                               ConQueueMode::F_EXACT_SZ)
-      : ConQueue(Alloc().allocate(max_size * sizeof(T)), max_size, flags) {
+                                               ConQueueMode::F_MC_HTS_DEQ)
+      : ConQueue(Alloc().allocate(aligned_size(max_size, flags)), max_size,
+                 flags) {
     self_alloc = true;
   }
   ~ConQueue() {
-    uint32_t _h = h, _t = t;
+    uint32_t _h = prod_head.pos, _t = cons_head.pos;
     for (uint32_t i = _t; i != _h; ++i) {
       ring[to_id(i)].~T();
     }
     if (self_alloc)
       Alloc().deallocate(ring, _max_size);
   }
-  bool empty() { return h_ == t_; }
-  bool full() { return h_ - t_ == _max_size; }
-  uint32_t size() { return h_ - t_; }
   uint32_t capacity() { return _max_size; }
+  uint32_t size() { return prod_tail.pos - cons_tail.pos; }
+  bool empty() { return prod_tail.pos == cons_tail.pos; }
+  bool full() { return prod_tail.pos - cons_tail.pos == capacity(); }
   // Guarantee that the reference will not be poped
-  T &front() { return ring[t_]; }
-  void clear() { pop_out_bulk(nullptr, size()); }
+  T &top() { return ring[cons_tail.pos]; }
+  void clear() { pop_bulk(nullptr, size()); }
   bool push(const T &__x) {
     if (flags & ConQueueMode::F_SP_ENQ) {
-      if (h - t_ == _max_size)
+      if (prod_head.pos - cons_tail.pos == capacity())
         return false;
-      ::new (&ring[to_id(h)]) T(__x);
-      ++h;
-      ++h_;
+
+      new (&ring[to_id(prod_head.pos)]) T(__x);
+
+      ++prod_head.pos;
+      ++prod_tail.pos;
     } else {
-      uint32_t _h = h, _h_;
+      union po_val_t oh, nh;
+      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
       do {
-        if (_h - t_ == _max_size)
+        if (oh.pos - cons_tail.pos == capacity())
           return false;
-      } while (!h.compare_exchange_weak(
-          _h, _h + 1, std::memory_order::memory_order_relaxed));
-      ::new (&ring[to_id(_h)]) T(__x);
-      // Wait for other threads to finish copying
-      _h_ = _h;
-      while (!h_.compare_exchange_weak(
-          _h_, _h_ + 1, std::memory_order::memory_order_relaxed)) {
-        std::this_thread::yield();
-        _h_ = _h;
+        nh.pos = oh.pos + 1;
+        if (flags & ConQueueMode::F_MP_RTS_ENQ)
+          nh.cnt = oh.cnt + 1;
+      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+
+      new (&ring[to_id(oh.pos)]) T(__x);
+
+      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
+        hts_update_ht(&prod_tail, 1, oh.pos);
+      } else {
+        rts_update_ht(&prod_head, &prod_tail);
+      }
+    }
+    return true;
+  }
+  template <typename... Args> bool emplace(Args &&...args) {
+    if (flags & ConQueueMode::F_SP_ENQ) {
+      if (prod_head.pos - cons_tail.pos == capacity())
+        return false;
+
+      new (&ring[to_id(prod_head.pos)]) T(std::forward<Args>(args)...);
+
+      ++prod_head.pos;
+      ++prod_tail.pos;
+    } else {
+      union po_val_t oh, nh;
+      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
+      do {
+        if (oh.pos - cons_tail.pos == capacity())
+          return false;
+        nh.pos = oh.pos + 1;
+        if (flags & ConQueueMode::F_MP_RTS_ENQ)
+          nh.cnt = oh.cnt + 1;
+      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+
+      new (&ring[to_id(oh.pos)]) T(std::forward<Args>(args)...);
+
+      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
+        hts_update_ht(&prod_tail, 1, oh.pos);
+      } else {
+        rts_update_ht(&prod_head, &prod_tail);
       }
     }
     return true;
   }
   /**
-   * @brief
+   * @brief push several elements as much as possible
    *
    * @param v
    * @param size
-   * @return The number of successful elem
+   * @return The number of pushed elements
    */
-  uint32_t push_bulk(const T *v, uint32_t size) {
+  uint32_t push_bulk(const T *v, uint32_t count) {
     uint32_t l;
     if (flags & ConQueueMode::F_SP_ENQ) {
-      l = std::min(_max_size - h + t_, size);
+      l = std::min(capacity() - prod_head.pos + cons_tail.pos, count);
       for (uint32_t i = 0; i < l; ++i) {
-        ::new (&ring[to_id(h + i)]) T(v[i]);
+        new (&ring[to_id(prod_head.pos + i)]) T(v[i]);
       }
-      h += l;
-      h_ += l;
+      prod_head.pos += l;
+      prod_tail.pos += l;
     } else {
-      uint32_t _h = h, _h_;
+      union po_val_t oh, nh;
+      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
       do {
-        l = std::min(_max_size - _h + t_, size);
-      } while (!h.compare_exchange_weak(
-          _h, _h + l, std::memory_order::memory_order_relaxed));
+        l = std::min(capacity() - oh.pos + cons_tail.pos, count);
+        if (l == 0)
+          return 0;
+        nh.pos = oh.pos + l;
+        if (flags & ConQueueMode::F_MP_RTS_ENQ)
+          nh.cnt = oh.cnt + 1;
+      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+
       for (uint32_t i = 0; i < l; ++i) {
-        ::new (&ring[to_id(_h + i)]) T(v[i]);
+        new (&ring[to_id(oh.pos + i)]) T(v[i]);
       }
-      // Wait for other threads to finish copying
-      _h_ = _h;
-      while (!h_.compare_exchange_weak(
-          _h_, _h_ + l, std::memory_order::memory_order_relaxed)) {
-        std::this_thread::yield();
-        _h_ = _h;
+
+      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
+        hts_update_ht(&prod_tail, l, oh.pos);
+      } else {
+        rts_update_ht(&prod_head, &prod_tail);
       }
     }
     return l;
   }
+  /**
+   * @brief push several elements as much as possible
+   *
+   * @param v
+   * @return The vector of pushed elements
+   */
   uint32_t push_bulk(const std::vector<T> &v) {
     return push_bulk(v.data(), v.size());
   }
-  bool pop_out(T *__x) {
+  bool pop(T *__x) {
     if (flags & ConQueueMode::F_SC_DEQ) {
-      if (t == h_)
+      if (cons_head.pos == prod_tail.pos)
         return false;
-      *__x = ring[to_id(t)];
-      ring[to_id(t)].~T();
-      ++t;
-      ++t_;
+
+      new (__x) T(std::move(ring[to_id(cons_head.pos)]));
+      ring[to_id(cons_head.pos)].~T();
+
+      ++cons_head.pos;
+      ++cons_tail.pos;
     } else {
-      uint32_t _t = t, _t_;
+      union po_val_t ot, nt;
+      ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
       do {
-        if (_t == h_)
+        if (ot.pos == prod_tail.pos)
           return false;
-      } while (!t.compare_exchange_weak(
-          _t, _t + 1, std::memory_order::memory_order_relaxed));
-      *__x = ring[to_id(_t)];
-      ring[to_id(_t)].~T();
-      // Wait for other threads to finish copying
-      _t_ = _t;
-      while (!t_.compare_exchange_weak(
-          _t_, _t_ + 1, std::memory_order::memory_order_relaxed)) {
-        std::this_thread::yield();
-        _t_ = _t;
+        nt.pos = ot.pos + 1;
+        if (flags & ConQueueMode::F_MC_RTS_DEQ)
+          nt.cnt = ot.cnt + 1;
+      } while (!__atomic_compare_exchange_n(&cons_head.raw, &ot.raw, nt.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+
+      new (__x) T(std::move(ring[to_id(ot.pos)]));
+      ring[to_id(ot.pos)].~T();
+
+      if (flags & ConQueueMode::F_MC_HTS_DEQ) {
+        hts_update_ht(&cons_tail, 1, ot.pos);
+      } else {
+        rts_update_ht(&cons_head, &cons_tail);
       }
     }
     return true;
   }
-  uint32_t pop_out_bulk(T *v, uint32_t count) {
+  /**
+   * @brief pop out several elements as much as possible
+   *
+   * @param v
+   * @param count
+   * @return The number of poped elements
+   */
+  uint32_t pop_bulk(T *v, uint32_t count) {
     uint32_t l = 0;
     if (flags & ConQueueMode::F_SC_DEQ) {
-      while (count != 0 && t < h_) {
-        if (v) {
-          v[l] = ring[to_id(t + l)];
-        }
-        ring[to_id(t + l)].~T();
+      uint32_t _count = count;
+      while (count != 0 && cons_head.pos < prod_tail.pos) {
+        new (v + l) T(std::move(ring[to_id(cons_head.pos + l)]));
+        ring[to_id(cons_head.pos + l)].~T();
         --count;
         ++l;
       }
-      t += l;
-      t_ += l;
+      cons_head += l;
+      cons_tail += l;
     } else {
-      uint32_t _t = t, _t_, c;
+      union po_val_t ot, nt;
+      ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
       do {
-        c = std::min(count, h_ - _t);
-      } while (!t.compare_exchange_weak(
-          _t, c + _t, std::memory_order::memory_order_relaxed));
-      if (c == 0)
-        return 0;
-      while (c != 0) {
-        if (v) {
-          v[l] = ring[to_id(_t + l)];
-        }
-        ring[to_id(_t + l)].~T();
-        --c;
-        ++l;
+        l = std::min(count, prod_tail.pos - ot.pos);
+        if (l == 0)
+          return 0;
+        nt.pos = ot.pos + l;
+        if (flags & ConQueueMode::F_MC_RTS_DEQ)
+          nt.cnt = ot.cnt + 1;
+      } while (!__atomic_compare_exchange_n(&cons_head.raw, &ot.raw, nt.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+
+      for (uint32_t i = 0; i < l; ++i) {
+        new (v + i) T(std::move(ring[to_id(ot.pos + i)]));
+        ring[to_id(ot.pos + i)].~T();
       }
-      // Wait for other threads to finish copying
-      _t_ = _t;
-      while (!t_.compare_exchange_weak(
-          _t_, _t_ + l, std::memory_order::memory_order_relaxed)) {
-        std::this_thread::yield();
-        _t_ = _t;
+
+      if (flags & ConQueueMode::F_MC_RTS_DEQ) {
+        hts_update_ht(&prod_tail, l, ot.pos);
+      } else {
+        rts_update_head(&prod_head, &prod_tail);
       }
     }
     return l;
   }
-  std::vector<T> pop_out_bulk(uint32_t count) {
+  /**
+   * @brief pop out several elements as much as possible
+   *
+   * @param count
+   * @return The vector of poped elements
+   */
+  std::vector<T> pop_bulk(uint32_t count) {
     std::vector<T> v;
     uint32_t l = 0;
     v.reserve(count);
-    l = pop_out_bulk(v.data(), count);
+    l = pop_bulk(v.data(), count);
     v.assign(v.data(), v.data() + l);
     return v;
   }
 
 private:
+  union po_val_t {
+    struct {
+      uint32_t pos;
+      uint32_t cnt;
+    };
+    uint64_t raw;
+  };
+
   /**
    *   t   --->  h
    * [][][][][][][]
    */
   T *ring;
   bool self_alloc;
-  std::atomic<uint32_t> h, h_;
-  std::atomic<uint32_t> t, t_;
+  volatile po_val_t prod_head, prod_tail;
+  volatile po_val_t cons_head, cons_tail;
   uint32_t flags;
   /**
-   * if F_EXACT_SZ: `count` is actual size
-   * else:          `count` is minmax 2^n - 1
+   * if F_EXACT_SZ: `count_mask` is actual size
+   * else:          `count_mask` is minmax 2^n - 1
    */
-  uint32_t count;
+  uint32_t count_mask;
   uint32_t _max_size;
 
   uint32_t to_id(uint32_t i) {
-    return (flags & ConQueueMode::F_EXACT_SZ) ? (i % count) : (i & count);
+    return (flags & ConQueueMode::F_EXACT_SZ) ? (i % count_mask)
+                                              : (i & count_mask);
+  }
+
+  static uint32_t aligned_size(uint32_t size, uint32_t flags) {
+    if ((flags & ConQueueMode::F_EXACT_SZ) == false) {
+      --size;
+      size |= size >> 1;
+      size |= size >> 2;
+      size |= size >> 4;
+      size |= size >> 8;
+      size |= size >> 16;
+    }
+    return size + 1;
+  }
+
+  static void hts_update_ht(volatile po_val_t *ht_, uint32_t n,
+                            uint32_t oht_pos) {
+    // Wait for other threads to finish copying
+    while (__atomic_load_n(&ht_->pos, __ATOMIC_ACQUIRE) != oht_pos)
+      std::this_thread::yield();
+    __atomic_fetch_add(&ht_->pos, n, __ATOMIC_RELEASE);
+  }
+
+  static void rts_update_ht(volatile po_val_t *ht, volatile po_val_t *ht_) {
+    union po_val_t h, oh, nh;
+    oh.raw = __atomic_load_n(&ht_->raw, __ATOMIC_ACQUIRE);
+    while (1) {
+      h.raw = __atomic_load_n(&ht->raw, __ATOMIC_RELAXED);
+      nh.raw = oh.raw;
+      if ((++nh.cnt) == h.cnt)
+        nh.pos = h.pos;
+      if (__atomic_compare_exchange_n(&ht_->raw, &oh.raw, nh.raw, true,
+                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+        break;
+      std::this_thread::yield();
+    }
   }
 };
 
@@ -259,7 +377,7 @@ public:
   void clear() { pop_out_bulk(nullptr, size()); }
   bool push(const T &__x) {
     node *n = pl_allocator<node>().allocate(1);
-    ::new (&n->item) T(__x);
+    new (&n->item) T(__x);
     n->next = nullptr;
     node *taild = tail.exchange(n);
     taild->next = n;
@@ -271,10 +389,10 @@ public:
       return 0;
     node *first, *last, *last_prev;
     first = last_prev = pl_allocator<node>().allocate(1);
-    ::new (&first->item) T(v[0]);
+    new (&first->item) T(v[0]);
     for (uint32_t i = 1; i < size; ++i) {
       last = pl_allocator<node>().allocate(1);
-      ::new (&last->item) T(v[i]);
+      new (&last->item) T(v[i]);
       last_prev->next = last;
       last_prev = last;
     }
