@@ -5,8 +5,7 @@
 #include <unordered_set>
 #include <vector>
 
-template <typename Key_t, typename Value_t>
-struct dtxn_base {
+template <typename Key_t, typename Value_t> struct dtxn_base {
   using txn_id_t = uint64_t;
   using timestamp_t = uint64_t;
 
@@ -77,13 +76,20 @@ struct dtxn_base {
 
       status_t s;
       bool is_ro_tx = false;
-      std::unordered_set<Key_t> locked_keys(txn_op_cache.size() * 3 / 2);
+      std::vector<Key_t> inserted_keys;
       std::vector<std::pair<Key_t, Value_t>> write_set;
+      std::unordered_set<Key_t> locked_keys(txn_op_cache.size() * 3 / 2);
 
       // 1. lock
       for (auto &p : txn_op_cache) {
         if (p.second.dirty) {
           s = base->lock_key(p.first);
+          if (s == not_found) {
+            s = base->insert_and_lock_empty_key_slot(p.first);
+            if (s == ok) {
+              inserted_keys.push_back(p.first);
+            }
+          }
           if (s != ok) {
             s = lock_error;
             goto release_lock;
@@ -138,6 +144,10 @@ struct dtxn_base {
       goto finish;
 
     release_lock:
+      for (auto &key : inserted_keys) {
+        base->erase_empty_key_slot(key);
+        locked_keys.erase(key);
+      }
       for (auto &key : locked_keys) {
         base->unlock_key(key);
       }
@@ -178,6 +188,8 @@ struct dtxn_base {
 
   virtual txn_id_t get_txn_id() = 0;
   virtual timestamp_t get_ts() = 0;
+  virtual status_t insert_and_lock_empty_key_slot(const Key_t &key) = 0;
+  virtual status_t erase_empty_key_slot(const Key_t &key) = 0;
   virtual status_t get_val(const Key_t &key, timestamp_t read_ts, Value_t &val,
                            timestamp_t &current_ts) = 0;
   virtual status_t put_val(const Key_t &key, timestamp_t write_ts,
@@ -230,7 +242,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
     auto &node = it->second;
     map_lock.unlock();
 
-    if (node.lock) {
+    if (node.lock && node.ver_list.begin()->ts <= read_ts) {
       return locked;
     }
     status_t s;
@@ -243,6 +255,36 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
     }
 
     return not_found;
+  }
+  virtual status_t insert_and_lock_empty_key_slot(const Key_t &key) override {
+    status_t s;
+    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+    map_lock.lock();
+    auto it = hmap.find(key);
+    if (it == hmap.end()) {
+      it = hmap.emplace(key, val_ver_node_head()).first;
+      auto &node = it->second;
+      __atomic_exchange_n(&node.lock, true, __ATOMIC_ACQUIRE);
+      s = ok;
+    } else {
+      s = locked;
+    }
+    map_lock.unlock();
+    return s;
+  }
+  virtual status_t erase_empty_key_slot(const Key_t &key) override {
+    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+    map_lock.lock();
+    auto it = hmap.find(key);
+    if (it == hmap.end()) {
+      map_lock.unlock();
+      return not_found;
+    }
+    hmap.erase(it);
+    map_lock.unlock();
+    return ok;
   }
   virtual status_t put_val(const Key_t &key, timestamp_t write_ts,
                            const Value_t &val) override {
