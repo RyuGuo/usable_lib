@@ -348,7 +348,8 @@ private:
   }
 };
 
-template <typename T> class ConQueueEX {
+template <typename T, template <typename _T> class Alloc = std::allocator>
+class ConQueueEX {
   struct node {
     volatile node *next;
     T item;
@@ -360,10 +361,9 @@ template <typename T> class ConQueueEX {
 
 public:
   ConQueueEX(uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                              ConQueueMode::F_MC_HTS_DEQ |
-                              ConQueueMode::F_EXACT_SZ)
+                              ConQueueMode::F_MC_HTS_DEQ)
       : flags(flags), __size(0), head(copyable_pair{nullptr, 0}) {
-    node *dummy = pl_allocator<node>().allocate(1);
+    node *dummy = Alloc<node>().allocate(1);
     dummy->next = nullptr;
     head = copyable_pair{dummy, 0};
     tail = dummy;
@@ -376,8 +376,17 @@ public:
   T &front() { return head.load().frist->next->item; }
   void clear() { pop_out_bulk(nullptr, size()); }
   bool push(const T &__x) {
-    node *n = pl_allocator<node>().allocate(1);
+    node *n = Alloc<node>().allocate(1);
     new (&n->item) T(__x);
+    n->next = nullptr;
+    node *taild = tail.exchange(n);
+    taild->next = n;
+    ++__size;
+    return true;
+  }
+  template <typename... Args> bool emplace(Args &&...args) {
+    node *n = Alloc<node>().allocate(1);
+    new (&n->item) T(std::forward<Args>(args)...);
     n->next = nullptr;
     node *taild = tail.exchange(n);
     taild->next = n;
@@ -388,10 +397,10 @@ public:
     if (size == 0)
       return 0;
     node *first, *last, *last_prev;
-    first = last_prev = pl_allocator<node>().allocate(1);
+    first = last_prev = Alloc<node>().allocate(1);
     new (&first->item) T(v[0]);
     for (uint32_t i = 1; i < size; ++i) {
-      last = pl_allocator<node>().allocate(1);
+      last = Alloc<node>().allocate(1);
       new (&last->item) T(v[i]);
       last_prev->next = last;
       last_prev = last;
@@ -417,7 +426,7 @@ public:
       *__x = next->item;
       next->item.~T();
       --__size;
-      pl_allocator<node>().deallocate(headd.first, 1);
+      Alloc<node>().deallocate(headd.first, 1);
       return true;
     } else {
       while (1) {
@@ -431,7 +440,7 @@ public:
           *__x = next->item;
           next->item.~T();
           --__size;
-          pl_allocator<node>().deallocate(headd.first, 1);
+          Alloc<node>().deallocate(headd.first, 1);
           return true;
         }
         std::this_thread::yield();
@@ -451,12 +460,10 @@ public:
       head = copyable_pair{next_last, headd.second + 1};
       node *p = headd.first;
       for (uint32_t i = 0; i < l; ++i) {
-        if (v) {
-          v[i] = p->next->item;
-        }
+        v[i] = p->next->item;
         p->next->item.~T();
         auto tmp = const_cast<node *>(p->next);
-        pl_allocator<node>().deallocate(p, 1);
+        Alloc<node>().deallocate(p, 1);
         p = tmp;
       }
       __size -= l;
@@ -473,12 +480,10 @@ public:
                 headd, copyable_pair{next_last, headd.second + 1})) {
           node *p = headd.first;
           for (uint32_t i = 0; i < l; ++i) {
-            if (v) {
-              v[i] = p->next->item;
-            }
+            v[i] = p->next->item;
             p->next->item.~T();
             auto tmp = const_cast<node *>(p->next);
-            pl_allocator<node>().deallocate(p, 1);
+            Alloc<node>().deallocate(p, 1);
             p = tmp;
           }
           __size -= l;

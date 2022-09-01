@@ -6,8 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
-template <typename _Tp, template <typename __Tp> class _Alloc = std::allocator>
-class pl_allocator : public _Alloc<_Tp> {
+template <typename _Tp, typename _Alloc = std::allocator<_Tp>>
+class pl_allocator : public _Alloc {
   struct pl_thread_data {
     std::vector<_Tp *> v_pl;
     std::unordered_map<_Tp *, std::size_t> v_map;
@@ -17,11 +17,11 @@ class pl_allocator : public _Alloc<_Tp> {
       for (std::size_t i = 0; i < v_pl.size(); ++i) {
         auto it = v_map.find(v_pl[i]);
         if (it != v_map.end()) {
-          _Alloc<_Tp>().deallocate(v_pl[i], it->second);
+          _Alloc().deallocate(v_pl[i], it->second);
           i += it->second - 1;
           v_map.erase(it);
         } else {
-          _Alloc<_Tp>().deallocate(v_pl[i], 1);
+          _Alloc().deallocate(v_pl[i], 1);
         }
       }
       if (!v_map.empty()) {
@@ -42,7 +42,7 @@ public:
 
     _Tp *p;
     if (v_pl.empty()) {
-      p = _Alloc<_Tp>::allocate(n);
+      p = _Alloc().allocate(n);
       if (n > 1) {
         v_map.insert(std::make_pair(p, n));
       }
