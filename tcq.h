@@ -1,6 +1,7 @@
 #ifndef __TCQ_H__
 #define __TCQ_H__
 
+#include "extend_mutex.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -9,7 +10,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include "extend_mutex.h"
 
 // Multi-Thread Task Combine Packing Queue
 template <typename Tp, typename Rp, typename CTX> class TCQueue {
@@ -36,6 +36,7 @@ public:
      * @param use_cv Whether to use `std::condition_variable` for waiting
      */
     virtual R task_get(bool use_cv = true) {
+      this->use_cv = use_cv;
       if (use_cv) {
         std::unique_lock<std::mutex> lck(wait_lck);
         while (!complete_flag)
@@ -81,9 +82,15 @@ private:
         uint32_t idx = it->second;
         FutureHandle *fh = fu_queue[idx];
         new (fh->re_buf) R(p.second);
-        fh->complete_flag = true;
-        if (fh->use_cv)
+
+        if (fh->use_cv) {
+          std::unique_lock<std::mutex> lck(fh->wait_lck);
+          fh->complete_flag = true;
+          lck.unlock();
           fh->wait_cv.notify_one();
+        } else {
+          fh->complete_flag = true;
+        }
       }
       R ret = *reinterpret_cast<R *>(this->re_buf);
       this->qu->dealloc_leader_handle(this);

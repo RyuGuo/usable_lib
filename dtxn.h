@@ -75,26 +75,58 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
         return aborted;
 
       status_t s;
+      std::vector<status_t> ss;
       bool is_ro_tx = false;
       std::vector<Key_t> inserted_keys;
       std::vector<std::pair<Key_t, Value_t>> write_set;
-      std::unordered_set<Key_t> locked_keys(txn_op_cache.size() * 3 / 2);
+      std::vector<Key_t> locked_keys;
+      std::vector<Key_t> insert_empty_key_slot;
+      std::vector<Key_t> common_key_stor;
 
       // 1. lock
+      auto &need_lock_keys = common_key_stor;
+      need_lock_keys.clear();
       for (auto &p : txn_op_cache) {
         if (p.second.dirty) {
-          s = base->lock_key(p.first);
-          if (s == not_found) {
-            s = base->insert_and_lock_empty_key_slot(p.first);
-            if (s == ok) {
-              inserted_keys.push_back(p.first);
-            }
-          }
-          if (s != ok) {
-            s = lock_error;
-            goto release_lock;
-          }
-          locked_keys.insert(p.first);
+          need_lock_keys.push_back(p.first);
+        }
+      }
+      ss = base->lock_key(need_lock_keys);
+      for (size_t i = 0; i < ss.size(); ++i) {
+        auto &_s = ss[i];
+        auto &key = need_lock_keys[i];
+        if (_s == ok) {
+          locked_keys.push_back(key);
+        }
+      }
+      for (size_t i = 0; i < ss.size(); ++i) {
+        auto &_s = ss[i];
+        if (_s != ok && _s != not_found) {
+          s = lock_error;
+          goto release_lock;
+        }
+      }
+      for (size_t i = 0; i < ss.size(); ++i) {
+        auto &_s = ss[i];
+        auto &key = need_lock_keys[i];
+        if (_s == not_found) {
+          insert_empty_key_slot.push_back(key);
+        }
+      }
+      ss = base->insert_and_lock_empty_key_slot(insert_empty_key_slot);
+      for (size_t i = 0; i < insert_empty_key_slot.size(); ++i) {
+        auto &_s = ss[i];
+        auto &key = insert_empty_key_slot[i];
+        if (_s == ok) {
+          inserted_keys.push_back(key);
+          locked_keys.push_back(key);
+        }
+      }
+      for (size_t i = 0; i < ss.size(); ++i) {
+        auto &_s = ss[i];
+        if (_s != ok) {
+          s = lock_error;
+          goto release_lock;
         }
       }
 
@@ -102,25 +134,34 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
 
       if (!is_ro_tx) {
         // 2. validate
+        std::vector<timestamp_t> current_tss;
+        auto &need_validate_keys = common_key_stor;
+        need_validate_keys.clear();
         for (auto &p : txn_op_cache) {
           if (!p.second.wo) {
-            timestamp_t current_ts;
-            s = base->get_key_lastest_ts(p.first, current_ts);
-            if (!((p.second.dirty && s == locked) || s == ok)) {
-              s = validate_error;
-              goto release_lock;
-            }
-            if (current_ts != p.second.current_read_ts) {
-              s = validate_error;
-              goto release_lock;
-            }
+            need_validate_keys.push_back(p.first);
+          }
+        }
+        ss = base->get_key_lastest_ts(need_validate_keys, current_tss);
+        for (size_t i = 0; i < ss.size(); ++i) {
+          auto &_s = ss[i];
+          auto &key = need_lock_keys[i];
+          auto &current_ts = current_tss[i];
+          auto &item = txn_op_cache[key];
+          if (!((item.dirty && _s == locked) || _s == ok)) {
+            s = validate_error;
+            goto release_lock;
+          }
+          if (current_ts != item.current_read_ts) {
+            s = validate_error;
+            goto release_lock;
           }
         }
 
         // 3. redo log
         write_ts = base->get_ts();
         for (auto &key : locked_keys) {
-          write_set.emplace_back(key, txn_op_cache.find(key)->second.val);
+          write_set.emplace_back(key, txn_op_cache[key].val);
         }
         s = base->write_redo_log(txn_id, write_ts, write_set);
         if (s != ok) {
@@ -129,28 +170,27 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
         }
 
         // 4. commit
-        for (auto &p : write_set) {
-          s = base->put_val(p.first, write_ts, p.second);
-          if (s != ok) {
-            s = apply_error;
-            goto release_lock;
-          }
-          base->unlock_key(p.first);
-          locked_keys.erase(p.first);
+        s = base->put_val(write_ts, write_set);
+        if (s != ok) {
+          s = apply_error;
+          goto release_lock;
         }
+        base->unlock_key(locked_keys);
       }
 
       s = ok;
       goto finish;
 
-    release_lock:
+    release_lock : {
+      std::unordered_set<Key_t> locked_set;
+      locked_set.insert(locked_keys.begin(), locked_keys.end());
+      base->erase_empty_key_slot(inserted_keys);
       for (auto &key : inserted_keys) {
-        base->erase_empty_key_slot(key);
-        locked_keys.erase(key);
+        locked_set.erase(key);
       }
-      for (auto &key : locked_keys) {
-        base->unlock_key(key);
-      }
+      locked_keys.assign(locked_set.begin(), locked_set.end());
+      base->unlock_key(locked_keys);
+    }
 
     finish:
       base = nullptr;
@@ -188,19 +228,22 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
 
   virtual txn_id_t get_txn_id() = 0;
   virtual timestamp_t get_ts() = 0;
-  virtual status_t insert_and_lock_empty_key_slot(const Key_t &key) = 0;
-  virtual status_t erase_empty_key_slot(const Key_t &key) = 0;
+  virtual std::vector<status_t>
+  insert_and_lock_empty_key_slot(const std::vector<Key_t> &keys) = 0;
+  virtual status_t erase_empty_key_slot(const std::vector<Key_t> &keys) = 0;
   virtual status_t get_val(const Key_t &key, timestamp_t read_ts, Value_t &val,
                            timestamp_t &current_ts) = 0;
-  virtual status_t put_val(const Key_t &key, timestamp_t write_ts,
-                           const Value_t &val) = 0;
-  virtual status_t lock_key(const Key_t &key) = 0;
-  virtual status_t unlock_key(const Key_t &key) = 0;
-  virtual status_t get_key_lastest_ts(const Key_t &key,
-                                      timestamp_t &current_ts) = 0;
+  virtual status_t
+  put_val(timestamp_t write_ts,
+          const std::vector<std::pair<Key_t, Value_t>> &kvs) = 0;
+  virtual std::vector<status_t> lock_key(const std::vector<Key_t> &keys) = 0;
+  virtual status_t unlock_key(const std::vector<Key_t> &keys) = 0;
+  virtual std::vector<status_t>
+  get_key_lastest_ts(const std::vector<Key_t> &keys,
+                     std::vector<timestamp_t> &current_ts) = 0;
   virtual status_t
   write_redo_log(txn_id_t txn_id, timestamp_t write_ts,
-                 const std::vector<std::pair<Key_t, Value_t>> &write_set) = 0;
+                 const std::vector<std::pair<Key_t, Value_t>> &kvs) = 0;
 };
 
 #include "extend_mutex.h"
@@ -256,119 +299,161 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
 
     return not_found;
   }
-  virtual status_t insert_and_lock_empty_key_slot(const Key_t &key) override {
+  virtual std::vector<status_t>
+  insert_and_lock_empty_key_slot(const std::vector<Key_t> &keys) override {
     status_t s;
-    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
-    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
-    map_lock.lock();
-    auto it = hmap.find(key);
-    if (it == hmap.end()) {
-      it = hmap.emplace(key, val_ver_node_head()).first;
-      auto &node = it->second;
-      __atomic_exchange_n(&node.lock, true, __ATOMIC_ACQUIRE);
-      s = ok;
-    } else {
-      s = locked;
-    }
-    map_lock.unlock();
-    return s;
-  }
-  virtual status_t erase_empty_key_slot(const Key_t &key) override {
-    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
-    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
-    map_lock.lock();
-    auto it = hmap.find(key);
-    if (it == hmap.end()) {
+    std::vector<status_t> ss;
+    for (auto &key : keys) {
+      auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+      auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+      map_lock.lock();
+      auto it = hmap.find(key);
+      if (it == hmap.end()) {
+        it = hmap.emplace(key, val_ver_node_head()).first;
+        auto &node = it->second;
+        __atomic_exchange_n(&node.lock, true, __ATOMIC_ACQUIRE);
+        s = ok;
+      } else {
+        s = locked;
+      }
       map_lock.unlock();
-      return not_found;
+      ss.push_back(s);
     }
-    hmap.erase(it);
-    map_lock.unlock();
+    return ss;
+  }
+  virtual status_t
+  erase_empty_key_slot(const std::vector<Key_t> &keys) override {
+    for (auto &key : keys) {
+      auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+      auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+      map_lock.lock();
+      auto it = hmap.find(key);
+      if (it == hmap.end()) {
+        map_lock.unlock();
+        return not_found;
+      }
+      hmap.erase(it);
+      map_lock.unlock();
+    }
     return ok;
   }
-  virtual status_t put_val(const Key_t &key, timestamp_t write_ts,
-                           const Value_t &val) override {
-    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
-    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
-    map_lock.lock();
-    auto it = hmap.find(key);
-    if (it == hmap.end()) {
-      it = hmap.emplace(key, val_ver_node_head()).first;
-    }
-    auto &node = it->second;
-    map_lock.unlock();
+  virtual status_t
+  put_val(timestamp_t write_ts,
+          const std::vector<std::pair<Key_t, Value_t>> &kvs) override {
+    for (auto &kv : kvs) {
+      Key_t key = kv.first;
+      Value_t val = kv.second;
 
-    for (auto it = node.ver_list.begin(); it != node.ver_list.end(); ++it) {
-      auto &n = *it;
-      if (n.ts <= write_ts) {
-        node.ver_list.insert(it, val_ver_node{write_ts, val});
-        break;
+      auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+      auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+      map_lock.lock();
+      auto it = hmap.find(key);
+      if (it == hmap.end()) {
+        it = hmap.emplace(key, val_ver_node_head()).first;
+      }
+      auto &node = it->second;
+      map_lock.unlock();
+
+      for (auto it = node.ver_list.begin(); it != node.ver_list.end(); ++it) {
+        auto &n = *it;
+        if (n.ts <= write_ts) {
+          node.ver_list.insert(it, val_ver_node{write_ts, val});
+          break;
+        }
+      }
+
+      if (node.ver_list.empty()) {
+        node.ver_list.insert(node.ver_list.begin(),
+                             val_ver_node{write_ts, val});
       }
     }
-
-    if (node.ver_list.empty()) {
-      node.ver_list.insert(node.ver_list.begin(), val_ver_node{write_ts, val});
-    }
     return ok;
   }
-  virtual status_t lock_key(const Key_t &key) override {
-    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
-    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
-    map_lock.lock_shared();
-    auto it = hmap.find(key);
-    if (it == hmap.end()) {
-      map_lock.unlock();
-      return not_found;
-    }
-    auto &node = it->second;
-    map_lock.unlock();
+  virtual std::vector<status_t>
+  lock_key(const std::vector<Key_t> &keys) override {
+    std::vector<status_t> ss;
+    std::vector<Key_t> locked_keys;
 
-    bool old = __atomic_exchange_n(&node.lock, true, __ATOMIC_ACQUIRE);
-    if (old) {
-      return locked;
+    for (auto &key : keys) {
+      auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+      auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+      map_lock.lock_shared();
+      auto it = hmap.find(key);
+      if (it == hmap.end()) {
+        map_lock.unlock();
+        ss.push_back(not_found);
+        continue;
+      }
+      auto &node = it->second;
+      map_lock.unlock();
+
+      bool old = __atomic_exchange_n(&node.lock, true, __ATOMIC_ACQUIRE);
+      if (old) {
+        goto release_lock;
+      }
+      ss.push_back(ok);
+      locked_keys.push_back(key);
     }
-    return ok;
+    return ss;
+
+  release_lock:
+    unlock_key(locked_keys);
+    ss.assign(keys.size(), locked);
+    return ss;
   }
-  virtual status_t unlock_key(const Key_t &key) override {
-    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
-    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
-    map_lock.lock_shared();
-    auto it = hmap.find(key);
-    if (it == hmap.end()) {
+  virtual status_t unlock_key(const std::vector<Key_t> &keys) override {
+    status_t s = ok;
+    for (auto &key : keys) {
+      auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+      auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+      map_lock.lock_shared();
+      auto it = hmap.find(key);
+      if (it == hmap.end()) {
+        map_lock.unlock();
+        s = not_found;
+        continue;
+      }
+      auto &node = it->second;
       map_lock.unlock();
-      return not_found;
-    }
-    auto &node = it->second;
-    map_lock.unlock();
 
-    __atomic_store_n(&node.lock, false, __ATOMIC_RELEASE);
-    return ok;
-  }
-  virtual status_t get_key_lastest_ts(const Key_t &key,
-                                      timestamp_t &current_ts) override {
-    auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
-    auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
-    status_t s;
-    map_lock.lock_shared();
-    auto it = hmap.find(key);
-    if (it == hmap.end()) {
-      map_lock.unlock();
-      return not_found;
+      __atomic_store_n(&node.lock, false, __ATOMIC_RELEASE);
     }
-    auto &node = it->second;
-    map_lock.unlock();
-
-    s = ok;
-    if (node.lock) {
-      s = locked;
-    }
-
-    current_ts = node.ver_list.begin()->ts;
     return s;
   }
-  virtual status_t write_redo_log(
-      txn_id_t txn_id, timestamp_t write_ts,
-      const std::vector<std::pair<Key_t, Value_t>> &write_set) override {
+  virtual std::vector<status_t>
+  get_key_lastest_ts(const std::vector<Key_t> &keys,
+                     std::vector<timestamp_t> &current_ts) override {
+    current_ts.clear();
+    status_t s;
+    std::vector<status_t> ss;
+
+    for (auto &key : keys) {
+      auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+      auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+      map_lock.lock_shared();
+      auto it = hmap.find(key);
+      if (it == hmap.end()) {
+        map_lock.unlock();
+        current_ts.resize(keys.size());
+        ss.assign(keys.size(), not_found);
+        return ss;
+      }
+      auto &node = it->second;
+      map_lock.unlock();
+
+      s = ok;
+      if (node.lock) {
+        s = locked;
+      }
+      ss.push_back(s);
+
+      current_ts.push_back(node.ver_list.begin()->ts);
+    }
+    return ss;
+  }
+  virtual status_t
+  write_redo_log(txn_id_t txn_id, timestamp_t write_ts,
+                 const std::vector<std::pair<Key_t, Value_t>> &kvs) override {
     return ok;
   }
 };
