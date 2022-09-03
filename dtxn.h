@@ -22,9 +22,15 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
     aborted,
   };
 
+  enum log_status_t {
+    put,
+    del,
+  };
+
   struct txn_cache_item_t {
     bool dirty;
     bool wo;
+    bool deleted;
     timestamp_t current_read_ts;
     Value_t val;
   };
@@ -50,8 +56,11 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
           return s;
         }
         txn_op_cache.emplace(
-            key, txn_cache_item_t{false, false, current_read_ts, val});
+            key, txn_cache_item_t{false, false, false, current_read_ts, val});
       } else {
+        if (it->second.deleted) {
+          return not_found;
+        }
         val = it->second.val;
       }
       return ok;
@@ -62,11 +71,30 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
 
       auto it = txn_op_cache.find(key);
       if (it == txn_op_cache.end()) {
-        txn_op_cache.emplace(key,
-                             txn_cache_item_t{true, true, max_timestamp, val});
+        txn_op_cache.emplace(
+            key, txn_cache_item_t{true, true, false, max_timestamp, val});
       } else {
         it->second.dirty = true;
+        it->second.deleted = false;
         it->second.val = val;
+      }
+      return ok;
+    }
+    status_t del(const Key_t &key) {
+      if (!base)
+        return aborted;
+
+      auto it = txn_op_cache.find(key);
+      if (it == txn_op_cache.end()) {
+        txn_op_cache.emplace(
+            key, txn_cache_item_t{true, true, true, max_timestamp, Value_t()});
+      } else if (it->second.deleted) {
+        return not_found;
+      } else if (it->second.wo) {
+        txn_op_cache.erase(key);
+      } else {
+        it->second.dirty = true;
+        it->second.deleted = true;
       }
       return ok;
     }
@@ -78,7 +106,7 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
       std::vector<status_t> ss;
       bool is_ro_tx = false;
       std::vector<Key_t> inserted_keys;
-      std::vector<std::pair<Key_t, Value_t>> write_set;
+      std::vector<std::tuple<Key_t, Value_t, log_status_t>> write_log;
       std::vector<Key_t> locked_keys;
       std::vector<Key_t> insert_empty_key_slot;
       std::vector<Key_t> common_key_stor;
@@ -134,9 +162,11 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
 
       if (!is_ro_tx) {
         // 2. validate
+        std::vector<std::pair<Key_t, Value_t>> write_kvs;
         std::vector<timestamp_t> current_tss;
         auto &need_validate_keys = common_key_stor;
         need_validate_keys.clear();
+
         for (auto &p : txn_op_cache) {
           if (!p.second.wo) {
             need_validate_keys.push_back(p.first);
@@ -160,17 +190,32 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
 
         // 3. redo log
         write_ts = base->get_ts();
+        auto &del_keys = common_key_stor;
+        del_keys.clear();
+
         for (auto &key : locked_keys) {
-          write_set.emplace_back(key, txn_op_cache[key].val);
+          auto &item = txn_op_cache[key];
+          write_kvs.emplace_back(key, item.val);
+          if (!item.deleted) {
+            write_log.emplace_back(key, item.val, log_status_t::put);
+          } else {
+            write_log.emplace_back(key, item.val, log_status_t::del);
+            del_keys.push_back(key);
+          }
         }
-        s = base->write_redo_log(txn_id, write_ts, write_set);
+        s = base->write_redo_log(txn_id, write_ts, write_log);
         if (s != ok) {
           s = log_error;
           goto release_lock;
         }
 
         // 4. commit
-        s = base->put_val(write_ts, write_set);
+        s = base->put_val(write_ts, write_kvs);
+        if (s != ok) {
+          s = apply_error;
+          goto release_lock;
+        }
+        s = base->del_val(write_ts, del_keys);
         if (s != ok) {
           s = apply_error;
           goto release_lock;
@@ -236,14 +281,16 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
   virtual status_t
   put_val(timestamp_t write_ts,
           const std::vector<std::pair<Key_t, Value_t>> &kvs) = 0;
+  virtual status_t del_val(timestamp_t write_ts,
+                           const std::vector<Key_t> &keys);
   virtual std::vector<status_t> lock_key(const std::vector<Key_t> &keys) = 0;
   virtual status_t unlock_key(const std::vector<Key_t> &keys) = 0;
   virtual std::vector<status_t>
   get_key_lastest_ts(const std::vector<Key_t> &keys,
                      std::vector<timestamp_t> &current_ts) = 0;
-  virtual status_t
-  write_redo_log(txn_id_t txn_id, timestamp_t write_ts,
-                 const std::vector<std::pair<Key_t, Value_t>> &kvs) = 0;
+  virtual status_t write_redo_log(
+      txn_id_t txn_id, timestamp_t write_ts,
+      const std::vector<std::tuple<Key_t, Value_t, log_status_t>> &kvs) = 0;
 };
 
 #include "extend_mutex.h"
@@ -256,6 +303,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
 
   struct val_ver_node {
     uint64_t ts;
+    bool tombstone;
     int val;
   };
 
@@ -272,6 +320,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
 
   virtual txn_id_t get_txn_id() override { return ++tid_gen; }
   virtual timestamp_t get_ts() override { return ++ts_gen; }
+
   virtual status_t get_val(const Key_t &key, timestamp_t read_ts, Value_t &val,
                            timestamp_t &current_ts) override {
     auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
@@ -291,8 +340,11 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
     status_t s;
     for (auto &n : node.ver_list) {
       if (n.ts <= read_ts) {
-        val = n.val;
         current_ts = n.ts;
+        if (n.tombstone) {
+          return not_found;
+        }
+        val = n.val;
         return ok;
       }
     }
@@ -357,14 +409,38 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
       for (auto it = node.ver_list.begin(); it != node.ver_list.end(); ++it) {
         auto &n = *it;
         if (n.ts <= write_ts) {
-          node.ver_list.insert(it, val_ver_node{write_ts, val});
+          node.ver_list.insert(it, val_ver_node{write_ts, false, val});
           break;
         }
       }
 
       if (node.ver_list.empty()) {
         node.ver_list.insert(node.ver_list.begin(),
-                             val_ver_node{write_ts, val});
+                             val_ver_node{write_ts, false, val});
+      }
+    }
+    return ok;
+  }
+  virtual status_t del_val(timestamp_t write_ts,
+                           const std::vector<Key_t> &keys) override {
+    for (auto &key : keys) {
+      auto &map_lock = this->map_lock[std::hash<Key_t>()(key) % lock_hash_max];
+      auto &hmap = this->hmap[std::hash<Key_t>()(key) % lock_hash_max];
+      map_lock.lock();
+      auto it = hmap.find(key);
+      if (it == hmap.end()) {
+        map_lock.unlock();
+        continue;
+      }
+      auto &node = it->second;
+      map_lock.unlock();
+
+      for (auto it = node.ver_list.begin(); it != node.ver_list.end(); ++it) {
+        auto &n = *it;
+        if (n.ts <= write_ts) {
+          node.ver_list.insert(it, val_ver_node{write_ts, true, Value_t()});
+          break;
+        }
       }
     }
     return ok;
@@ -453,8 +529,40 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
   }
   virtual status_t
   write_redo_log(txn_id_t txn_id, timestamp_t write_ts,
-                 const std::vector<std::pair<Key_t, Value_t>> &kvs) override {
+                 const std::vector<std::tuple<Key_t, Value_t, log_status_t>>
+                     &kvs) override {
     return ok;
+  }
+
+  void gc_version(timestamp_t gc_ts) {
+    for (int i = 0; i < lock_hash_max; ++i) {
+      auto &map_lock = this->map_lock[i];
+      auto &hmap = this->hmap[i];
+      for (auto hit = ++hmap.begin(); hit != hmap.end();) {
+        auto &p = *hit;
+        auto &ver_list = p.second.ver_list;
+        for (auto it = ++ver_list.begin(); it != ver_list.end(); ++it) {
+          if (it->ts <= gc_ts) {
+            while (
+                __atomic_exchange_n(&p.second.lock, true, __ATOMIC_ACQUIRE)) {
+            }
+            ver_list.erase(it, ver_list.end());
+            if (ver_list.size() == 1 && ver_list.begin()->tombstone) {
+              map_lock.lock();
+              ++hit;
+              hmap.erase(p.first);
+              map_lock.unlock();
+              goto l;
+            }
+            __atomic_store_n(&p.second.lock, false, __ATOMIC_RELEASE);
+            break;
+          }
+        }
+        ++hit;
+      l:
+        continue;
+      }
+    }
   }
 };
 
