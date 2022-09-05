@@ -282,7 +282,7 @@ template <typename Key_t, typename Value_t> struct dtxn_base {
   put_val(timestamp_t write_ts,
           const std::vector<std::pair<Key_t, Value_t>> &kvs) = 0;
   virtual status_t del_val(timestamp_t write_ts,
-                           const std::vector<Key_t> &keys);
+                           const std::vector<Key_t> &keys) = 0;
   virtual std::vector<status_t> lock_key(const std::vector<Key_t> &keys) = 0;
   virtual status_t unlock_key(const std::vector<Key_t> &keys) = 0;
   virtual std::vector<status_t>
@@ -308,7 +308,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
   };
 
   struct val_ver_node_head {
-    volatile bool lock = false;
+    volatile uint8_t lock = 0;
     std::list<val_ver_node> ver_list;
   };
 
@@ -334,10 +334,11 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
     auto &node = it->second;
     map_lock.unlock();
 
-    if (node.lock && node.ver_list.begin()->ts <= read_ts) {
+    if (__atomic_load_n(&node.lock, __ATOMIC_RELAXED) != 0 &&
+        node.ver_list.begin()->ts <= read_ts) {
       return locked;
     }
-    status_t s;
+
     for (auto &n : node.ver_list) {
       if (n.ts <= read_ts) {
         current_ts = n.ts;
@@ -363,7 +364,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
       if (it == hmap.end()) {
         it = hmap.emplace(key, val_ver_node_head()).first;
         auto &node = it->second;
-        __atomic_exchange_n(&node.lock, true, __ATOMIC_ACQUIRE);
+        __atomic_exchange_n(&node.lock, 1, __ATOMIC_ACQUIRE);
         s = ok;
       } else {
         s = locked;
@@ -463,7 +464,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
       auto &node = it->second;
       map_lock.unlock();
 
-      bool old = __atomic_exchange_n(&node.lock, true, __ATOMIC_ACQUIRE);
+      uint8_t old = __atomic_exchange_n(&node.lock, 1, __ATOMIC_ACQUIRE);
       if (old) {
         goto release_lock;
       }
@@ -492,7 +493,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
       auto &node = it->second;
       map_lock.unlock();
 
-      __atomic_store_n(&node.lock, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&node.lock, 0, __ATOMIC_RELEASE);
     }
     return s;
   }
@@ -518,7 +519,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
       map_lock.unlock();
 
       s = ok;
-      if (node.lock) {
+      if (__atomic_load_n(&node.lock, __ATOMIC_RELAXED) != 0) {
         s = locked;
       }
       ss.push_back(s);
@@ -538,13 +539,13 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
     for (int i = 0; i < lock_hash_max; ++i) {
       auto &map_lock = this->map_lock[i];
       auto &hmap = this->hmap[i];
-      for (auto hit = ++hmap.begin(); hit != hmap.end();) {
+      for (auto hit = hmap.begin(); hit != hmap.end();) {
         auto &p = *hit;
         auto &ver_list = p.second.ver_list;
         for (auto it = ++ver_list.begin(); it != ver_list.end(); ++it) {
           if (it->ts <= gc_ts) {
             while (
-                __atomic_exchange_n(&p.second.lock, true, __ATOMIC_ACQUIRE)) {
+                __atomic_exchange_n(&p.second.lock, 1, __ATOMIC_ACQUIRE)) {
             }
             ver_list.erase(it, ver_list.end());
             if (ver_list.size() == 1 && ver_list.begin()->tombstone) {
@@ -554,7 +555,7 @@ struct SimpleTxnManager : public dtxn_base<int, int> {
               map_lock.unlock();
               goto l;
             }
-            __atomic_store_n(&p.second.lock, false, __ATOMIC_RELEASE);
+            __atomic_store_n(&p.second.lock, 0, __ATOMIC_RELEASE);
             break;
           }
         }
