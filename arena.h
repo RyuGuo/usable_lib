@@ -34,7 +34,7 @@ private:
     }
   };
 
-  uint32_t get_ptr_to_bid(const char *ptr) {
+  uint32_t get_ptr_to_bid(const char *ptr) const {
     return (ptr - memory_base()) / block_size;
   }
 
@@ -55,7 +55,7 @@ private:
   }
 
 public:
-  char *memory_base() { return blocks[0].base; }
+  char *memory_base() const { return blocks[0].base; }
 
   Arena(char *mr, size_t nbytes) : nbytes(nbytes) {
     if (nbytes % block_size != 0)

@@ -65,13 +65,13 @@ public:
     if (self_alloc)
       Alloc().deallocate(ring, _max_size);
   }
-  uint32_t capacity() { return _max_size; }
-  uint32_t size() { return prod_tail.pos - cons_tail.pos; }
-  bool empty() { return prod_tail.pos == cons_tail.pos; }
-  bool full() { return prod_tail.pos - cons_tail.pos == capacity(); }
+  uint32_t capacity() const { return _max_size; }
+  uint32_t size() const { return prod_tail.pos - cons_tail.pos; }
+  bool empty() const { return prod_tail.pos == cons_tail.pos; }
+  bool full() const { return prod_tail.pos - cons_tail.pos == capacity(); }
   // Guarantee that the reference will not be poped
-  T &top() { return ring[cons_tail.pos]; }
-  void clear() { pop_bulk(nullptr, size()); }
+  T &top() const { return ring[cons_tail.pos]; }
+  void clear() { pop_bulk(size()); }
   bool push(const T &__x) {
     if (flags & ConQueueMode::F_SP_ENQ) {
       if (prod_head.pos - cons_tail.pos == capacity())
@@ -297,8 +297,6 @@ private:
    */
   T *ring;
   bool self_alloc;
-  volatile po_val_t prod_head, prod_tail;
-  volatile po_val_t cons_head, cons_tail;
   uint32_t flags;
   /**
    * if F_EXACT_SZ: `count_mask` is actual size
@@ -306,6 +304,11 @@ private:
    */
   uint32_t count_mask;
   uint32_t _max_size;
+
+  volatile po_val_t prod_head __attribute__((aligned(64)));
+  volatile po_val_t prod_tail;
+  volatile po_val_t cons_head __attribute__((aligned(64)));
+  volatile po_val_t cons_tail;
 
   uint32_t to_id(uint32_t i) {
     return (flags & ConQueueMode::F_EXACT_SZ) ? (i % count_mask)
@@ -370,11 +373,11 @@ public:
   }
   ~ConQueueEX() { clear(); }
 
-  bool empty() { return __size == 0; }
-  uint32_t size() { return __size; }
+  bool empty() const { return __size == 0; }
+  uint32_t size() const { return __size; }
   // Guarantee that the reference will not be poped
-  T &front() { return head.load().frist->next->item; }
-  void clear() { pop_out_bulk(nullptr, size()); }
+  T &front() const { return head.load().frist->next->item; }
+  void clear() { pop_bulk(size()); }
   bool push(const T &__x) {
     node *n = Alloc<node>().allocate(1);
     new (&n->item) T(__x);
@@ -415,7 +418,7 @@ public:
   uint32_t push_bulk(const std::vector<T> &v) {
     return push_bulk(v.data(), v.size());
   }
-  bool pop_out(T *__x) {
+  bool pop(T *__x) {
     copyable_pair headd;
     if (flags & ConQueueMode::F_SC_DEQ) {
       headd = head;
@@ -423,7 +426,7 @@ public:
       if (next == nullptr)
         return false;
       head = copyable_pair{next, headd.second + 1};
-      *__x = next->item;
+      new (__x) T(std::move(next->item));
       next->item.~T();
       --__size;
       Alloc<node>().deallocate(headd.first, 1);
@@ -437,7 +440,7 @@ public:
 
         if (head.compare_exchange_weak(headd,
                                        copyable_pair{next, headd.second + 1})) {
-          *__x = next->item;
+          new (__x) T(std::move(next->item));
           next->item.~T();
           --__size;
           Alloc<node>().deallocate(headd.first, 1);
@@ -447,7 +450,7 @@ public:
       }
     }
   }
-  uint32_t pop_out_bulk(T *v, uint32_t count) {
+  uint32_t pop_bulk(T *v, uint32_t count) {
     uint32_t l;
     copyable_pair headd;
     if (flags & ConQueueMode::F_SC_DEQ) {
@@ -494,11 +497,11 @@ public:
     }
     return l;
   }
-  std::vector<T> pop_out_bulk(uint32_t count) {
+  std::vector<T> pop_bulk(uint32_t count) {
     std::vector<T> v;
-    uint32_t l;
+    uint32_t l = 0;
     v.reserve(count);
-    l = pop_out_bulk(v.data(), count);
+    l = pop_bulk(v.data(), count);
     v.assign(v.data(), v.data() + l);
     return v;
   }

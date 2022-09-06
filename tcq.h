@@ -123,14 +123,14 @@ private:
       if (cnt == max_count)
         return -1;
       if (queue_cnt_.compare_exchange_weak(cnt, cnt + 1,
-                                           std::memory_order_relaxed))
+                                           std::memory_order_acquire))
         return cnt;
       std::this_thread::yield();
     }
   }
 
   // Confirmation after queue insertion.
-  void enqueue_confirm() { ++queue_cnt; }
+  void enqueue_confirm() { queue_cnt.fetch_add(1, std::memory_order_release); }
 
   uint64_t gettime() {
     return std::chrono::duration_cast<std::chrono::microseconds>(

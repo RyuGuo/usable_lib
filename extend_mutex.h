@@ -35,7 +35,6 @@ public:
   spin_mutex(int pshared = PTHREAD_PROCESS_PRIVATE) {
     pthread_spin_init(&spinlock, pshared);
   }
-
   ~spin_mutex() { pthread_spin_destroy(&spinlock); }
 
   void lock() { pthread_spin_lock(&spinlock); }
@@ -128,7 +127,7 @@ public:
     uint8_t _l = l.fetch_add(2, std::memory_order_acquire);
     while (_l & 1) {
       std::this_thread::yield();
-      _l = l.load(std::memory_order_acquire);
+      _l = l.load(std::memory_order_relaxed);
     }
   }
   bool try_lock() {
@@ -136,7 +135,7 @@ public:
     return l.compare_exchange_weak(_l, 1, std::memory_order_acquire);
   }
   bool try_lock_shared() {
-    uint8_t _l = l.fetch_add(2, std::memory_order_release);
+    uint8_t _l = l.fetch_add(2, std::memory_order_acquire);
     if (_l & 1) {
       l.fetch_sub(2, std::memory_order_release);
       return false;

@@ -49,7 +49,7 @@ inline uint64_t ror64(uint64_t in, int x) {
 class hash32 {
   int seed;
 
-  constexpr inline uint32_t fmix32(uint32_t h) {
+  uint32_t fmix32(uint32_t h) const {
     h ^= h >> 16;
     h *= 0x85ebca6b;
     h ^= h >> 13;
@@ -62,9 +62,11 @@ public:
   hash32() : seed(0) {}
   hash32(int seed) : seed(seed) {}
 
-  uint32_t operator()(uint32_t x) { return seed ^ ror32(x * 0x9e3779b1U, 24); }
+  uint32_t operator()(uint32_t x) const {
+    return seed ^ ror32(x * 0x9e3779b1U, 24);
+  }
 
-  uint32_t operator()(const void *s, uint32_t len) {
+  uint32_t operator()(const void *s, uint32_t len) const {
     const uint8_t *data = (const uint8_t *)s;
     const int nblocks = len / 4;
     uint32_t h1 = seed;
@@ -101,7 +103,9 @@ public:
     return h1;
   }
 
-  uint32_t operator()(std::string &s) { return (*this)(s.data(), s.size()); }
+  uint32_t operator()(std::string &s) const {
+    return (*this)(s.data(), s.size());
+  }
 };
 
 class hash64 {
@@ -111,11 +115,11 @@ public:
   hash64() : seed(0) {}
   hash64(int seed) : seed(seed) {}
 
-  uint64_t operator()(uint64_t x) {
+  uint64_t operator()(uint64_t x) const {
     return seed ^ ror64(x * 0x9e3779b97f4a7c15LU, 24);
   }
 
-  uint64_t operator()(const void *s, uint32_t len) {
+  uint64_t operator()(const void *s, uint32_t len) const {
     const uint64_t m = 0xc6a4a7935bd1e995;
     const int r = 47;
 
@@ -162,19 +166,20 @@ public:
     return h;
   }
 
-  uint64_t operator()(std::string &s) { return (*this)(s.data(), s.size()); }
+  uint64_t operator()(std::string &s) const {
+    return (*this)(s.data(), s.size());
+  }
 };
 
 class hash128 {
   int seed;
 
-  uint64_t fmix64(uint64_t k) {
+  uint64_t fmix64(uint64_t k) const {
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccd;
     k ^= k >> 33;
     k *= 0xc4ceb9fe1a85ec53;
     k ^= k >> 33;
-
     return k;
   }
 
@@ -182,7 +187,7 @@ public:
   hash128() : seed(0) {}
   hash128(int seed) : seed(seed) {}
 
-  std::pair<uint64_t, uint64_t> operator()(const void *s, uint32_t len) {
+  std::pair<uint64_t, uint64_t> operator()(const void *s, uint32_t len) const {
     const uint8_t *data = (const uint8_t *)s;
     const int nblocks = len / 16;
 
@@ -288,7 +293,7 @@ public:
     return std::make_pair(h1, h2);
   }
 
-  std::pair<uint64_t, uint64_t> operator()(std::string &s) {
+  std::pair<uint64_t, uint64_t> operator()(std::string &s) const {
     return (*this)(s.data(), s.size());
   }
 };

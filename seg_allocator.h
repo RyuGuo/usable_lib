@@ -20,7 +20,7 @@ struct SegAllocator {
     free_seg_set_siz.insert(std::make_pair(size, base));
     free_seg_set_off.insert(std::make_pair(base, size));
   }
-  bool has_free_seg(size_t size) {
+  bool has_free_seg(size_t size) const {
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     return iter != free_seg_set_siz.end();
   }

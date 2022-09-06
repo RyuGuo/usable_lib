@@ -109,7 +109,7 @@ public:
     count = 0;
   }
 
-  const std::vector<uint64_t> &get_hist() { return hist; }
+  const std::vector<uint64_t> &get_hist() const { return hist; }
 
   void add_sample(D d) {
     if (d < min_ || d > max_)
@@ -119,7 +119,7 @@ public:
     ++count;
   }
 
-  double average() {
+  double average() const {
     double S = 0;
     for (uint32_t i = 0; i < hist.size(); ++i) {
       S += hist[i] * ((i + 0.5) * interval + min_);
@@ -127,7 +127,7 @@ public:
     return S / count;
   }
 
-  double percentage(double p) {
+  double percentage(double p) const {
     uint64_t pd = 0;
     uint32_t left_border = 0, right_border = hist.size();
     for (uint32_t i = 0; i < hist.size(); ++i) {

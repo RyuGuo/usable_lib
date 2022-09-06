@@ -20,12 +20,12 @@ class CSVFileStream {
   std::string path;
   std::vector<std::string> fields;
 
-  template <typename T> __always_inline void __appendEntry(const T &t) {
+  template <typename T> void __appendEntry(const T &t) {
     fs << t << std::endl;
   }
 
   template <typename T, typename... Rest>
-  __always_inline void __appendEntry(const T &t, const Rest &...rest) {
+  void __appendEntry(const T &t, const Rest &...rest) {
     fs << t << ',';
     __appendEntry(rest...);
   }
@@ -86,7 +86,7 @@ public:
   const std::vector<std::string> &getFields() { return fields; }
 
   template <typename... Args>
-  __always_inline void appendEntry(const Args &...args) {
+  void appendEntry(const Args &...args) {
     __appendEntry(args...);
   }
 };

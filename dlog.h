@@ -38,6 +38,13 @@
   DLOG_STREAM(stderr, "[ERROR] " format ": %s", ##__VA_ARGS__, strerror(errno))
 #define DLOG_WARNING(format, ...)                                              \
   DLOG_STREAM(stderr, "[WARNING] " format, ##__VA_ARGS__)
+#define DLOG_FATAL(format, ...)                                                \
+  do {                                                                         \
+    DLOG_STREAM(stderr, "[FATAL] " format ": %s", ##__VA_ARGS__,               \
+                strerror(errno));                                              \
+    fflush(stdout);                                                            \
+    abort();                                                                   \
+  } while (0)
 
 #define DLOG(format, ...) DLOG_INFO(format, ##__VA_ARGS__)
 
@@ -89,18 +96,14 @@ inline constexpr const char *type_fmt(const void *) { return "%p"; }
       snprintf(fmt, sizeof(fmt), "Because " #val_a " = %s, " #val_b " = %s",   \
                type_fmt(a), type_fmt(b));                                      \
       snprintf(tmp, sizeof(tmp), fmt, a, b);                                   \
-      DLOG_ERROR("Assertion `" #val_a " " #op " " #val_b "` failed. %s", tmp); \
-      fflush(stdout);                                                          \
-      abort();                                                                 \
+      DLOG_FATAL("Assertion `" #val_a " " #op " " #val_b "` failed. %s", tmp); \
     }                                                                          \
   } while (0)
 
 #define DLOG_ASSERT(expr, format...)                                           \
   do {                                                                         \
     if (__glibc_unlikely(!(expr))) {                                           \
-      DLOG_ERROR("Assertion `" #expr "` failed. " format);                     \
-      fflush(stdout);                                                          \
-      abort();                                                                 \
+      DLOG_FATAL("Assertion `" #expr "` failed. " format);                     \
     }                                                                          \
   } while (0)
 

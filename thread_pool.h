@@ -92,7 +92,7 @@ public:
     add_threads(threads);
   }
 
-  uint8_t count() { return workers.size(); }
+  uint8_t count() const { return workers.size(); }
 
   void add_threads(uint8_t threads) {
     threads = min(threads, max_thread_count - count());
