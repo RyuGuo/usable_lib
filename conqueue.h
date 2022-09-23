@@ -11,6 +11,7 @@
 #include "pl_allocator.h"
 #include <atomic>
 #include <emmintrin.h>
+#include <iterator>
 #include <sys/cdefs.h>
 #include <thread>
 #include <vector>
@@ -187,8 +188,42 @@ public:
    * @param v
    * @return The vector of pushed elements
    */
-  uint32_t push_bulk(const std::vector<T> &v) {
-    return push_bulk(v.data(), v.size());
+  template <typename Iter>
+  uint32_t push_bulk(Iter first, Iter last) {
+    uint32_t l;
+    uint32_t count = std::distance(first, last);
+    if (flags & ConQueueMode::F_SP_ENQ) {
+      l = std::min(capacity() - prod_head.pos + cons_tail.pos, count);
+      for (uint32_t i = 0; i < l; ++i) {
+        new (&ring[to_id(prod_head.pos + i)]) T(*(first++));
+      }
+      prod_head.pos += l;
+      prod_tail.pos += l;
+    } else {
+      union po_val_t oh, nh;
+      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
+      do {
+        l = std::min(capacity() - oh.pos + cons_tail.pos, count);
+        if (l == 0)
+          return 0;
+        nh.pos = oh.pos + l;
+        if (flags & ConQueueMode::F_MP_RTS_ENQ)
+          nh.cnt = oh.cnt + 1;
+      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+
+      for (uint32_t i = 0; i < l; ++i) {
+        new (&ring[to_id(oh.pos + i)]) T(*(first++));
+      }
+
+      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
+        hts_update_ht(&prod_tail, l, oh.pos);
+      } else {
+        rts_update_ht(&prod_head, &prod_tail);
+      }
+    }
+    return l;
   }
   bool pop(T *__x) {
     if (flags & ConQueueMode::F_SC_DEQ) {
@@ -241,8 +276,8 @@ public:
         --count;
         ++l;
       }
-      cons_head += l;
-      cons_tail += l;
+      cons_head.pos += l;
+      cons_tail.pos += l;
     } else {
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
