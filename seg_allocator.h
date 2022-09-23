@@ -14,7 +14,6 @@ struct SegAllocator {
   size_t size;
 
   void init(uint64_t base, size_t size) {
-    std::unique_lock<std::mutex> lck(lock);
     free_seg_set_siz.clear();
     free_seg_set_off.clear();
     free_seg_set_siz.insert(std::make_pair(size, base));

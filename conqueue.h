@@ -10,6 +10,8 @@
 
 #include "pl_allocator.h"
 #include <atomic>
+#include <emmintrin.h>
+#include <sys/cdefs.h>
 #include <thread>
 #include <vector>
 
@@ -74,7 +76,7 @@ public:
   void clear() { pop_bulk(size()); }
   bool push(const T &__x) {
     if (flags & ConQueueMode::F_SP_ENQ) {
-      if (prod_head.pos - cons_tail.pos == capacity())
+      if (__glibc_unlikely(prod_head.pos - cons_tail.pos == capacity()))
         return false;
 
       new (&ring[to_id(prod_head.pos)]) T(__x);
@@ -85,7 +87,7 @@ public:
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
       do {
-        if (oh.pos - cons_tail.pos == capacity())
+        if (__glibc_unlikely(oh.pos - cons_tail.pos == capacity()))
           return false;
         nh.pos = oh.pos + 1;
         if (flags & ConQueueMode::F_MP_RTS_ENQ)
@@ -104,9 +106,10 @@ public:
     }
     return true;
   }
+  bool push(T &&__x) { return emplace(std::move(__x)); }
   template <typename... Args> bool emplace(Args &&...args) {
     if (flags & ConQueueMode::F_SP_ENQ) {
-      if (prod_head.pos - cons_tail.pos == capacity())
+      if (__glibc_unlikely(prod_head.pos - cons_tail.pos == capacity()))
         return false;
 
       new (&ring[to_id(prod_head.pos)]) T(std::forward<Args>(args)...);
@@ -117,7 +120,7 @@ public:
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
       do {
-        if (oh.pos - cons_tail.pos == capacity())
+        if (__glibc_unlikely(oh.pos - cons_tail.pos == capacity()))
           return false;
         nh.pos = oh.pos + 1;
         if (flags & ConQueueMode::F_MP_RTS_ENQ)
@@ -189,7 +192,7 @@ public:
   }
   bool pop(T *__x) {
     if (flags & ConQueueMode::F_SC_DEQ) {
-      if (cons_head.pos == prod_tail.pos)
+      if (__glibc_unlikely(cons_head.pos == prod_tail.pos))
         return false;
 
       new (__x) T(std::move(ring[to_id(cons_head.pos)]));
@@ -201,7 +204,7 @@ public:
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
       do {
-        if (ot.pos == prod_tail.pos)
+        if (__glibc_unlikely(ot.pos == prod_tail.pos))
           return false;
         nt.pos = ot.pos + 1;
         if (flags & ConQueueMode::F_MC_RTS_DEQ)
@@ -259,10 +262,10 @@ public:
         ring[to_id(ot.pos + i)].~T();
       }
 
-      if (flags & ConQueueMode::F_MC_RTS_DEQ) {
-        hts_update_ht(&prod_tail, l, ot.pos);
+      if (flags & ConQueueMode::F_MC_HTS_DEQ) {
+        hts_update_ht(&cons_tail, l, ot.pos);
       } else {
-        rts_update_head(&prod_head, &prod_tail);
+        rts_update_ht(&cons_head, &cons_tail);
       }
     }
     return l;
@@ -310,6 +313,8 @@ private:
   volatile po_val_t cons_head __attribute__((aligned(64)));
   volatile po_val_t cons_tail;
 
+  static const int REP_COUNT = 3;
+
   uint32_t to_id(uint32_t i) {
     return (flags & ConQueueMode::F_EXACT_SZ) ? (i % count_mask)
                                               : (i & count_mask);
@@ -330,9 +335,15 @@ private:
   static void hts_update_ht(volatile po_val_t *ht_, uint32_t n,
                             uint32_t oht_pos) {
     // Wait for other threads to finish copying
-    while (__atomic_load_n(&ht_->pos, __ATOMIC_ACQUIRE) != oht_pos)
-      std::this_thread::yield();
-    __atomic_fetch_add(&ht_->pos, n, __ATOMIC_RELEASE);
+    int rep = 0;
+    while (ht_->pos != oht_pos) {
+      _mm_pause();
+      if (++rep == REP_COUNT) {
+        rep = 0;
+        std::this_thread::yield();
+      }
+    }
+    ht_->pos += n;
   }
 
   static void rts_update_ht(volatile po_val_t *ht, volatile po_val_t *ht_) {
@@ -387,6 +398,7 @@ public:
     ++__size;
     return true;
   }
+  bool push(T &&__x) { return emplace(std::move(__x)); }
   template <typename... Args> bool emplace(Args &&...args) {
     node *n = Alloc<node>().allocate(1);
     new (&n->item) T(std::forward<Args>(args)...);
