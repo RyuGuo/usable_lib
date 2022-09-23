@@ -8,13 +8,11 @@
 #ifndef __CONQUEUE_H__
 #define __CONQUEUE_H__
 
-#include "pl_allocator.h"
 #include <atomic>
 #include <emmintrin.h>
 #include <iterator>
 #include <sys/cdefs.h>
 #include <thread>
-#include <vector>
 
 enum ConQueueMode {
   F_SP_ENQ = 1,
@@ -61,10 +59,7 @@ public:
     self_alloc = true;
   }
   ~ConQueue() {
-    uint32_t _h = prod_head.pos, _t = cons_head.pos;
-    for (uint32_t i = _t; i != _h; ++i) {
-      ring[to_id(i)].~T();
-    }
+    clear();
     if (self_alloc)
       Alloc().deallocate(ring, _max_size);
   }
@@ -74,7 +69,13 @@ public:
   bool full() const { return prod_tail.pos - cons_tail.pos == capacity(); }
   // Guarantee that the reference will not be poped
   T &top() const { return ring[cons_tail.pos]; }
-  void clear() { pop_bulk(size()); }
+  void clear() {
+    uint32_t _h = prod_head.pos, _t = cons_head.pos;
+    for (uint32_t i = _t; i != _h; ++i) {
+      ring[to_id(i)].~T();
+    }
+    prod_head.pos = prod_tail.pos = cons_head.pos = cons_tail.pos = 0;
+  }
   bool push(const T &__x) {
     if (flags & ConQueueMode::F_SP_ENQ) {
       if (__glibc_unlikely(prod_head.pos - cons_tail.pos == capacity()))
@@ -143,53 +144,11 @@ public:
   /**
    * @brief push several elements as much as possible
    *
-   * @param v
-   * @param size
+   * @param first input first iterator
+   * @param last input last iterator
    * @return The number of pushed elements
    */
-  uint32_t push_bulk(const T *v, uint32_t count) {
-    uint32_t l;
-    if (flags & ConQueueMode::F_SP_ENQ) {
-      l = std::min(capacity() - prod_head.pos + cons_tail.pos, count);
-      for (uint32_t i = 0; i < l; ++i) {
-        new (&ring[to_id(prod_head.pos + i)]) T(v[i]);
-      }
-      prod_head.pos += l;
-      prod_tail.pos += l;
-    } else {
-      union po_val_t oh, nh;
-      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
-      do {
-        l = std::min(capacity() - oh.pos + cons_tail.pos, count);
-        if (l == 0)
-          return 0;
-        nh.pos = oh.pos + l;
-        if (flags & ConQueueMode::F_MP_RTS_ENQ)
-          nh.cnt = oh.cnt + 1;
-      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
-                                            true, __ATOMIC_ACQUIRE,
-                                            __ATOMIC_ACQUIRE));
-
-      for (uint32_t i = 0; i < l; ++i) {
-        new (&ring[to_id(oh.pos + i)]) T(v[i]);
-      }
-
-      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
-        hts_update_ht(&prod_tail, l, oh.pos);
-      } else {
-        rts_update_ht(&prod_head, &prod_tail);
-      }
-    }
-    return l;
-  }
-  /**
-   * @brief push several elements as much as possible
-   *
-   * @param v
-   * @return The vector of pushed elements
-   */
-  template <typename Iter>
-  uint32_t push_bulk(Iter first, Iter last) {
+  template <typename Iter> uint32_t push_bulk(Iter first, Iter last) {
     uint32_t l;
     uint32_t count = std::distance(first, last);
     if (flags & ConQueueMode::F_SP_ENQ) {
@@ -262,16 +221,16 @@ public:
   /**
    * @brief pop out several elements as much as possible
    *
-   * @param v
-   * @param count
+   * @param first output first iterator
+   * @param last output last iterator
    * @return The number of poped elements
    */
-  uint32_t pop_bulk(T *v, uint32_t count) {
+  template <typename Iter> uint32_t pop_bulk(Iter first, Iter last) {
     uint32_t l = 0;
+    uint32_t count = std::distance(first, last);
     if (flags & ConQueueMode::F_SC_DEQ) {
-      uint32_t _count = count;
       while (count != 0 && cons_head.pos < prod_tail.pos) {
-        new (v + l) T(std::move(ring[to_id(cons_head.pos + l)]));
+        new (&*(first++)) T(std::move(ring[to_id(cons_head.pos + l)]));
         ring[to_id(cons_head.pos + l)].~T();
         --count;
         ++l;
@@ -293,7 +252,7 @@ public:
                                             __ATOMIC_ACQUIRE));
 
       for (uint32_t i = 0; i < l; ++i) {
-        new (v + i) T(std::move(ring[to_id(ot.pos + i)]));
+        new (&*(first++)) T(std::move(ring[to_id(ot.pos + i)]));
         ring[to_id(ot.pos + i)].~T();
       }
 
@@ -304,20 +263,6 @@ public:
       }
     }
     return l;
-  }
-  /**
-   * @brief pop out several elements as much as possible
-   *
-   * @param count
-   * @return The vector of poped elements
-   */
-  std::vector<T> pop_bulk(uint32_t count) {
-    std::vector<T> v;
-    uint32_t l = 0;
-    v.reserve(count);
-    l = pop_bulk(v.data(), count);
-    v.assign(v.data(), v.data() + l);
-    return v;
   }
 
 private:
@@ -399,6 +344,165 @@ private:
 
 template <typename T, template <typename _T> class Alloc = std::allocator>
 class ConQueueEX {
+public:
+  ConQueueEX(uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
+                              ConQueueMode::F_MC_HTS_DEQ)
+      : flags(flags), size_(0), head(copyable_pair{nullptr, 0}) {
+    node *dummy = Alloc<node>().allocate(1);
+    dummy->next = nullptr;
+    head.store(copyable_pair{dummy, 0}, std::memory_order_relaxed);
+    tail = dummy;
+  }
+  ~ConQueueEX() {
+    clear();
+    node *dummy = head.load(std::memory_order_relaxed).first;
+    Alloc<node>().deallocate(dummy, 1);
+  }
+
+  uint32_t capacity() const { return size_.load(std::memory_order_relaxed); }
+  uint32_t size() const { return size_.load(std::memory_order_relaxed); }
+  bool empty() const { return size_.load(std::memory_order_relaxed) == 0; }
+  // Guarantee that the reference will not be poped
+  bool full() const { return false; }
+  T &top() const {
+    return head.load(std::memory_order_relaxed).frist->next->item;
+  }
+  void clear() {
+    node *dummy = head.load(std::memory_order_relaxed).first;
+    node *next = const_cast<node *>(dummy->next);
+    dummy->next = nullptr;
+    head.store(copyable_pair{dummy, 0}, std::memory_order_relaxed);
+    while (next) {
+      next->item.~T();
+      auto tmp = const_cast<node *>(next->next);
+      Alloc<node>().deallocate(next, 1);
+      next = tmp;
+    }
+    size_ = 0;
+  }
+  bool push(const T &__x) {
+    node *n = Alloc<node>().allocate(1);
+    new (&n->item) T(__x);
+    n->next = nullptr;
+    node *taild = tail.exchange(n, std::memory_order_acquire);
+    taild->next = n;
+    ++size_;
+    return true;
+  }
+  bool push(T &&__x) { return emplace(std::move(__x)); }
+  template <typename... Args> bool emplace(Args &&...args) {
+    node *n = Alloc<node>().allocate(1);
+    new (&n->item) T(std::forward<Args>(args)...);
+    n->next = nullptr;
+    node *taild = tail.exchange(n, std::memory_order_acquire);
+    taild->next = n;
+    ++size_;
+    return true;
+  }
+  template <typename Iter> uint32_t push_bulk(Iter first, Iter last) {
+    uint32_t count = std::distance(first, last);
+    if (count == 0)
+      return 0;
+    node *firstn, *lastn, *last_prev;
+    firstn = last_prev = Alloc<node>().allocate(1);
+    new (&firstn->item) T(*(first++));
+    for (uint32_t i = 1; i < count; ++i) {
+      lastn = Alloc<node>().allocate(1);
+      new (&lastn->item) T(*(first++));
+      last_prev->next = lastn;
+      last_prev = lastn;
+    }
+    lastn->next = nullptr;
+
+    node *taild = tail.exchange(lastn, std::memory_order_acquire);
+    taild->next = firstn;
+    size_ += count;
+    return count;
+  }
+  bool pop(T *__x) {
+    copyable_pair headd;
+    if (flags & ConQueueMode::F_SC_DEQ) {
+      headd = head.load(std::memory_order_relaxed);
+      node *next = const_cast<node *>(headd.first->next);
+      if (next == nullptr)
+        return false;
+      head.store(copyable_pair{next, headd.second + 1},
+                 std::memory_order_relaxed);
+      new (__x) T(std::move(next->item));
+      next->item.~T();
+      --size_;
+      Alloc<node>().deallocate(headd.first, 1);
+      return true;
+    } else {
+      while (1) {
+        headd = head.load(std::memory_order_acquire);
+        node *next = const_cast<node *>(headd.first->next);
+        if (next == nullptr)
+          return false;
+
+        if (head.compare_exchange_weak(headd,
+                                       copyable_pair{next, headd.second + 1}),
+            std::memory_order_acquire) {
+          new (__x) T(std::move(next->item));
+          next->item.~T();
+          --size_;
+          Alloc<node>().deallocate(headd.first, 1);
+          return true;
+        }
+        std::this_thread::yield();
+      }
+    }
+  }
+  template <typename Iter> uint32_t pop_bulk(Iter first, Iter last) {
+    uint32_t count = std::distance(first, last);
+    uint32_t l;
+    copyable_pair headd;
+    if (flags & ConQueueMode::F_SC_DEQ) {
+      headd = head.load(std::memory_order_relaxed);
+      node *next = const_cast<node *>(headd.first->next),
+           *next_last = headd.first;
+      for (l = 0; l < count && next_last->next != nullptr;
+           next_last = const_cast<node *>(next_last->next), ++l)
+        ;
+      head.store(copyable_pair{next_last, headd.second + 1},
+                 std::memory_order_relaxed);
+      node *p = headd.first;
+      for (uint32_t i = 0; i < l; ++i) {
+        new (&*(first++)) T(p->next->item);
+        p->next->item.~T();
+        auto tmp = const_cast<node *>(p->next);
+        Alloc<node>().deallocate(p, 1);
+        p = tmp;
+      }
+    } else {
+      while (1) {
+        headd = head.load(std::memory_order_acquire);
+        node *next = const_cast<node *>(headd.first->next),
+             *next_last = headd.first;
+        for (l = 0; l < count && next_last->next != nullptr;
+             next_last = const_cast<node *>(next_last->next), ++l)
+          ;
+        if (head.compare_exchange_weak(
+                headd, copyable_pair{next_last, headd.second + 1}),
+            std::memory_order_acquire) {
+          node *p = headd.first;
+          for (uint32_t i = 0; i < l; ++i) {
+            new (&*(first++)) T(p->next->item);
+            p->next->item.~T();
+            auto tmp = const_cast<node *>(p->next);
+            Alloc<node>().deallocate(p, 1);
+            p = tmp;
+          }
+          break;
+        }
+        std::this_thread::yield();
+      }
+    }
+    size_ -= l;
+    return l;
+  }
+
+private:
   struct node {
     volatile node *next;
     T item;
@@ -408,154 +512,8 @@ class ConQueueEX {
     uint64_t second;
   };
 
-public:
-  ConQueueEX(uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                              ConQueueMode::F_MC_HTS_DEQ)
-      : flags(flags), __size(0), head(copyable_pair{nullptr, 0}) {
-    node *dummy = Alloc<node>().allocate(1);
-    dummy->next = nullptr;
-    head = copyable_pair{dummy, 0};
-    tail = dummy;
-  }
-  ~ConQueueEX() { clear(); }
-
-  bool empty() const { return __size == 0; }
-  uint32_t size() const { return __size; }
-  // Guarantee that the reference will not be poped
-  T &front() const { return head.load().frist->next->item; }
-  void clear() { pop_bulk(size()); }
-  bool push(const T &__x) {
-    node *n = Alloc<node>().allocate(1);
-    new (&n->item) T(__x);
-    n->next = nullptr;
-    node *taild = tail.exchange(n);
-    taild->next = n;
-    ++__size;
-    return true;
-  }
-  bool push(T &&__x) { return emplace(std::move(__x)); }
-  template <typename... Args> bool emplace(Args &&...args) {
-    node *n = Alloc<node>().allocate(1);
-    new (&n->item) T(std::forward<Args>(args)...);
-    n->next = nullptr;
-    node *taild = tail.exchange(n);
-    taild->next = n;
-    ++__size;
-    return true;
-  }
-  uint32_t push_bulk(const T *v, uint32_t size) {
-    if (size == 0)
-      return 0;
-    node *first, *last, *last_prev;
-    first = last_prev = Alloc<node>().allocate(1);
-    new (&first->item) T(v[0]);
-    for (uint32_t i = 1; i < size; ++i) {
-      last = Alloc<node>().allocate(1);
-      new (&last->item) T(v[i]);
-      last_prev->next = last;
-      last_prev = last;
-    }
-    last->next = nullptr;
-
-    node *taild = tail.exchange(last);
-    taild->next = first;
-    __size += size;
-    return size;
-  }
-  uint32_t push_bulk(const std::vector<T> &v) {
-    return push_bulk(v.data(), v.size());
-  }
-  bool pop(T *__x) {
-    copyable_pair headd;
-    if (flags & ConQueueMode::F_SC_DEQ) {
-      headd = head;
-      node *next = const_cast<node *>(headd.first->next);
-      if (next == nullptr)
-        return false;
-      head = copyable_pair{next, headd.second + 1};
-      new (__x) T(std::move(next->item));
-      next->item.~T();
-      --__size;
-      Alloc<node>().deallocate(headd.first, 1);
-      return true;
-    } else {
-      while (1) {
-        headd = head;
-        node *next = const_cast<node *>(headd.first->next);
-        if (next == nullptr)
-          return false;
-
-        if (head.compare_exchange_weak(headd,
-                                       copyable_pair{next, headd.second + 1})) {
-          new (__x) T(std::move(next->item));
-          next->item.~T();
-          --__size;
-          Alloc<node>().deallocate(headd.first, 1);
-          return true;
-        }
-        std::this_thread::yield();
-      }
-    }
-  }
-  uint32_t pop_bulk(T *v, uint32_t count) {
-    uint32_t l;
-    copyable_pair headd;
-    if (flags & ConQueueMode::F_SC_DEQ) {
-      headd = head;
-      node *next = const_cast<node *>(headd.first->next),
-           *next_last = headd.first;
-      for (l = 0; l < count && next_last->next != nullptr;
-           next_last = const_cast<node *>(next_last->next), ++l)
-        ;
-      head = copyable_pair{next_last, headd.second + 1};
-      node *p = headd.first;
-      for (uint32_t i = 0; i < l; ++i) {
-        v[i] = p->next->item;
-        p->next->item.~T();
-        auto tmp = const_cast<node *>(p->next);
-        Alloc<node>().deallocate(p, 1);
-        p = tmp;
-      }
-      __size -= l;
-      return l;
-    } else {
-      while (1) {
-        headd = head;
-        node *next = const_cast<node *>(headd.first->next),
-             *next_last = headd.first;
-        for (l = 0; l < count && next_last->next != nullptr;
-             next_last = const_cast<node *>(next_last->next), ++l)
-          ;
-        if (head.compare_exchange_weak(
-                headd, copyable_pair{next_last, headd.second + 1})) {
-          node *p = headd.first;
-          for (uint32_t i = 0; i < l; ++i) {
-            v[i] = p->next->item;
-            p->next->item.~T();
-            auto tmp = const_cast<node *>(p->next);
-            Alloc<node>().deallocate(p, 1);
-            p = tmp;
-          }
-          __size -= l;
-          return l;
-        }
-        std::this_thread::yield();
-      }
-    }
-    return l;
-  }
-  std::vector<T> pop_bulk(uint32_t count) {
-    std::vector<T> v;
-    uint32_t l = 0;
-    v.reserve(count);
-    l = pop_bulk(v.data(), count);
-    v.assign(v.data(), v.data() + l);
-    return v;
-  }
-
-private:
   uint32_t flags;
-  std::atomic<uint32_t> __size;
+  std::atomic<uint32_t> size_;
   std::atomic<node *> tail;
   std::atomic<copyable_pair> head;
 };
