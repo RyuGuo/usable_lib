@@ -1,6 +1,5 @@
 #include "mm_allocator.h"
 #include "./../conqueue.h"
-#include "./../extend_mutex.h"
 #include "./../fatomic.h"
 #include "./../lfbitset.h"
 #include "./../seg_allocator.h"
@@ -11,6 +10,7 @@
 #include <map>
 #include <set>
 #include <string.h>
+#include <vector>
 
 #define SLAB_UNIT_SIZE 64
 #define SIZE_CLASS_NUM 32

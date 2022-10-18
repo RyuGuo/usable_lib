@@ -404,7 +404,7 @@ public:
     if (count == 0)
       return 0;
     node *firstn, *lastn, *last_prev;
-    firstn = last_prev = Alloc<node>().allocate(1);
+    firstn = last_prev = lastn = Alloc<node>().allocate(1);
     new (&firstn->item) T(*(first++));
     for (uint32_t i = 1; i < count; ++i) {
       lastn = Alloc<node>().allocate(1);
