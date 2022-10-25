@@ -7,64 +7,55 @@
 #include <stdexcept>
 #include <vector>
 
-template <typename Iter> double summation(const Iter first, const Iter last) {
-  double sum = 0;
+template <typename T, typename Iter> T summation(Iter first, Iter last) {
+  T sum = 0;
   for (; first != last; ++first)
     sum += *first;
   return sum;
 }
 
-template <typename Iter, typename BinaryOperation>
-double summation(const Iter first, const Iter last, BinaryOperation op) {
-  double sum = 0;
+template <typename T, typename Iter, typename BinaryOperation>
+auto summation(Iter first, Iter last, BinaryOperation op) {
+  T sum = 0;
   for (; first != last; ++first)
     sum = op(*first, sum);
   return sum;
 }
 
-template <typename Iter> double average(const Iter first, const Iter last) {
-  double sum = 0;
-  unsigned int n = 0;
-  for (; first != last; ++first, ++n)
-    sum += *first;
-  return sum / n;
+template <typename Iter> double average(Iter first, Iter last) {
+  return summation<double>(first, last) / std::distance(first, last);
 }
 
 template <typename Iter, typename BinaryOperation>
-double average(const Iter first, const Iter last, BinaryOperation op) {
-  double sum = 0;
-  unsigned int n = 0;
-  for (; first != last; ++first, ++n)
-    sum = op(*first, sum);
-  return sum / n;
+double average(Iter first, Iter last, BinaryOperation op) {
+  return summation<double>(first, last, op) / std::distance(first, last);
 }
 
-template <typename Iter> double variance(const Iter first, const Iter last) {
-  using T = typename std::remove_reference<decltype(*first)>::type;
+template <typename Iter> double variance(Iter first, Iter last) {
+  using T = decltype(*first);
   double avg = average(first, last);
-  return average(first, last, [avg](T x, double p) {
+  return average(first, last, [avg](const T x, const double p) {
     double tmp = x - avg;
     return p + tmp * tmp;
   });
 }
 
 template <typename Iter, typename BinaryOperation>
-double variance(const Iter first, const Iter last, BinaryOperation op) {
-  using T = typename std::remove_reference<decltype(*first)>::type;
+double variance(Iter first, Iter last, BinaryOperation op) {
+  using T = decltype(*first);
   double avg = average(first, last);
-  return average(first, last, [avg, &op](T x, double p) {
+  return average(first, last, [avg, &op](const T x, const double p) {
     double tmp = op(x, -avg);
     return p + tmp * tmp;
   });
 }
 
-template <typename Iter>
-double stddeviation(const Iter first, const Iter last) {
+template <typename Iter> double stddeviation(Iter first, Iter last) {
   return std::sqrt(variance(first, last));
 }
 
 template <typename Iter, typename BinaryOperation>
-double stddeviation(const Iter first, const Iter last, BinaryOperation op) {
+double stddeviation(Iter first, Iter last, BinaryOperation op) {
   return std::sqrt(variance(first, last, op));
 }
 
@@ -74,94 +65,87 @@ double stddeviation(const Iter first, const Iter last, BinaryOperation op) {
  */
 class zipf_distribution {
 public:
-  zipf_distribution(uint32_t n, double q = 1.0) : _n(n), _q(q) {
+  zipf_distribution(uint32_t n, double q = 1.0) : n_(n), q_(q) {
     std::vector<double> pdf(n);
     for (uint32_t i = 0; i < n; ++i) {
       pdf[i] = std::pow((double)i + 1, -q);
     }
-    _dist = std::discrete_distribution<uint32_t>(pdf.begin(), pdf.end());
+    dist_ = std::discrete_distribution<uint32_t>(pdf.begin(), pdf.end());
   }
 
   template <typename Generator> uint32_t operator()(Generator &g) {
-    return _dist(g) + 1;
+    return dist_(g) + 1;
   }
 
   uint32_t min() { return 1; }
-  uint32_t max() { return _n; }
+  uint32_t max() { return n_; }
 
 private:
-  uint32_t _n;
-  double _q;
-  std::discrete_distribution<uint32_t> _dist;
+  uint32_t n_;
+  double q_;
+  std::discrete_distribution<uint32_t> dist_;
 };
 
 template <typename D> class Histogram {
 public:
-  Histogram(D min_, D max_, D interval = 10000)
-      : min_(min_), max_(max_), interval(interval), count(0) {
-    uint32_t count = (max_ - min_) / interval + 1;
-    hist.assign(count, 0);
+  // [min, upper)
+  Histogram(D min, D upper, D bcount = 10000)
+      : min_(min), upper_(upper), interval_((upper - min) / bcount), count_(0) {
+    hist_.assign(bcount, 0);
   }
 
   void clear() {
-    uint32_t count = (max_ - min_) / interval + 1;
-    hist.assign(count, 0);
-    count = 0;
+    count_ = 0;
+    hist_.assign(hist_.size(), 0);
   }
 
-  const std::vector<uint64_t> &get_hist() const { return hist; }
+  const std::vector<uint64_t> &get_hist() const { return hist_; }
 
   void add_sample(D d) {
-    if (d < min_ || d > max_)
+    if (d < min_ || d >= upper_)
       throw std::out_of_range("out of range");
-    uint32_t which_b = (d - min_) / interval;
-    ++hist[which_b];
-    ++count;
+    uint32_t which_b = (d - min_) / interval_;
+    ++hist_[which_b];
+    ++count_;
   }
 
   double average() const {
     double S = 0;
-    for (uint32_t i = 0; i < hist.size(); ++i) {
-      S += hist[i] * ((i + 0.5) * interval + min_);
+    for (uint32_t i = 0; i < hist_.size(); ++i) {
+      S += hist_[i] * ((i + 0.5) * interval_ + min_);
     }
-    return S / count;
+    return S / count_;
   }
 
   double percentage(double p) const {
     uint64_t pd = 0;
-    uint32_t left_border = 0, right_border = hist.size();
-    for (uint32_t i = 0; i < hist.size(); ++i) {
-      pd += hist[i];
-      double tmp = 1.0 * pd / count;
-      if (tmp <= p) {
-        left_border = i;
-      }
-      if (tmp >= p) {
+    uint32_t right_border = hist_.size() - 1;
+    for (uint32_t i = 0; i < hist_.size(); ++i) {
+      pd += hist_[i];
+      if (pd >= p * count_) {
         right_border = i;
         break;
       }
     }
-    return right_border * interval + min_;
+    return (right_border + 0.5) * interval_ + min_;
+  }
+
+  static Histogram<D> merge(Histogram<D> &h1, Histogram<D> &h2) {
+    Histogram<D> nh(std::min(h1.min_, h2.min_), std::max(h1.upper_, h2.upper_),
+                    std::max(h1.hist_.size(), h2.hist_.size()));
+    for (uint32_t i = 0; i < h1.hist_.size(); ++i)
+      for (uint64_t j = 0; j < h1.hist_[i]; ++j)
+        nh.add_sample((i + 0.5) * h1.interval_ + h1.min_);
+    for (uint32_t i = 0; i < h2.hist_.size(); ++i)
+      for (uint64_t j = 0; j < h2.hist_[i]; ++j)
+        nh.add_sample((i + 0.5) * h2.interval_ + h2.min_);
+    return nh;
   }
 
 private:
-  D min_, max_;
-  D interval;
-  uint64_t count;
-  std::vector<uint64_t> hist;
+  D min_, upper_, interval_;
+  uint64_t count_;
+  std::vector<uint64_t> hist_;
 };
-
-template <typename D>
-static Histogram<D> merge(Histogram<D> &h1, Histogram<D> &h2) {
-  Histogram<D> nh(std::min(h1.min_, h2.min_), std::max(h1.max_, h2.max_),
-                  std::min(h1.interval, h2.interval));
-  for (uint32_t i = 0; i < h1.get_hist().size(); ++i)
-    for (uint64_t j = 0; j < h1.get_hist()[i]; ++j)
-      nh.add_sample((i + 0.5) * h1.interval + h1.min_);
-  for (uint32_t i = 0; i < h2.get_hist().size(); ++i)
-    for (uint64_t j = 0; j < h2.get_hist()[i]; ++j)
-      nh.add_sample((i + 0.5) * h2.interval + h2.min_);
-  return nh;
-}
 
 #endif // __STATISTIC_H__

@@ -149,4 +149,19 @@ private:
   std::atomic<uint8_t> l;
 };
 
+template <typename Mutex> class SingleFlight {
+public:
+  template <typename F, typename... Args> void call(F &&fn, Args &&...args) {
+    if (mu.try_lock()) {
+      fn(std::forward<Args>(args)...);
+    } else {
+      mu.lock();
+    }
+    mu.unlock();
+  }
+
+private:
+  Mutex mu;
+};
+
 #endif // __EXTEND_MUTEX_H__
