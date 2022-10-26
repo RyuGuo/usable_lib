@@ -63,12 +63,13 @@ public:
 
     friend class TCQueue;
     friend struct leader_handle;
-    FutureHandle() : complete_flag(false), use_cv(true) {}
+    FutureHandle() : use_cv(true), complete_flag(false) {}
+    virtual ~FutureHandle() {};
   };
 
 private:
   struct leader_handle : public FutureHandle {
-    R task_get(bool) {
+    R task_get(bool) override {
       std::vector<std::pair<UID_t, R>> b = this->qu->hook_batch_ret_collection(
           *reinterpret_cast<CTX_t *>(uctx_buf), uid_map.size());
       if (b.size() != uid_map.size())
@@ -102,7 +103,7 @@ private:
       task_queue = static_cast<T *>(::operator new(sizeof(T) * max_count));
       fu_queue = new FutureHandle *[max_count];
     }
-    ~leader_handle() {
+    ~leader_handle() override {
       delete[] uid_queue;
       delete[] task_queue;
       delete[] fu_queue;
@@ -183,7 +184,7 @@ public:
    * @param wait_us   Queue Wait Time
    */
   TCQueue(uint32_t max_count, uint32_t wait_us)
-      : max_count(max_count), wait_us(wait_us), queue_valid(false) {
+      : queue_valid(false), max_count(max_count), wait_us(wait_us) {
     free_fh.reserve(max_count);
   }
   ~TCQueue() {
@@ -266,7 +267,7 @@ public:
       }
 
       uint32_t idx = enqueue_ready();
-      if (idx == -1) {
+      if (idx == -1u) {
         uint8_t _ver = static_cast<uint8_t>(queue_ver);
         wlck.unlock_shared();
         // If the queue is full, wait for the queue to expire before retrying.

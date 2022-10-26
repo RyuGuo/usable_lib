@@ -9,6 +9,7 @@
 #define __CONQUEUE_H__
 
 #include <atomic>
+#include <cstdlib>
 #include <emmintrin.h>
 #include <iterator>
 #include <sys/cdefs.h>
@@ -28,7 +29,7 @@ public:
   ConQueue(T *ring, uint32_t max_size,
            uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
                             ConQueueMode::F_MC_HTS_DEQ)
-      : ring(ring), flags(flags), _max_size(max_size), self_alloc(false) {
+      : ring(ring), self_alloc(false), flags(flags), max_size(max_size) {
     prod_head.raw = prod_tail.raw = cons_head.raw = cons_tail.raw = 0;
 
     if (ring == nullptr)
@@ -61,9 +62,9 @@ public:
   ~ConQueue() {
     clear();
     if (self_alloc)
-      Alloc().deallocate(ring, _max_size);
+      Alloc().deallocate(ring, max_size);
   }
-  uint32_t capacity() const { return _max_size; }
+  uint32_t capacity() const { return max_size; }
   uint32_t size() const { return prod_tail.pos - cons_tail.pos; }
   bool empty() const { return prod_tail.pos == cons_tail.pos; }
   bool full() const { return prod_tail.pos - cons_tail.pos == capacity(); }
@@ -286,7 +287,7 @@ private:
    * else:          `count_mask` is minmax 2^n - 1
    */
   uint32_t count_mask;
-  uint32_t _max_size;
+  uint32_t max_size;
 
   volatile po_val_t prod_head __attribute__((aligned(64)));
   volatile po_val_t prod_tail;
@@ -362,8 +363,8 @@ public:
   uint32_t capacity() const { return size_.load(std::memory_order_relaxed); }
   uint32_t size() const { return size_.load(std::memory_order_relaxed); }
   bool empty() const { return size_.load(std::memory_order_relaxed) == 0; }
-  // Guarantee that the reference will not be poped
   bool full() const { return false; }
+  // Guarantee that the reference will not be poped
   T &top() const {
     return head.load(std::memory_order_relaxed).frist->next->item;
   }
@@ -516,6 +517,134 @@ private:
   std::atomic<uint32_t> size_;
   std::atomic<node *> tail;
   std::atomic<copyable_pair> head;
+};
+
+template <typename T> class CmQueue {
+public:
+  CmQueue(uint32_t max_size) {
+    // find max_size = SLOT_MAX_INLINE * 2^n
+    uint32_t s = SLOT_MAX_INLINE;
+    while (s < max_size)
+      s <<= 1;
+    this->max_size = s;
+    max_line = s / SLOT_MAX_INLINE;
+    max_line_mask = max_line - 1;
+    max_line_mask_bits = __builtin_popcount(max_line_mask);
+    cls = (cache_line_t *)aligned_alloc(64, max_line * sizeof(cache_line_t));
+    clear();
+  }
+  ~CmQueue() { free(cls); }
+
+  uint32_t capacity() const { return max_size; }
+  uint32_t size() const {
+    return head.load(std::memory_order_relaxed) -
+           tail.load(std::memory_order_relaxed);
+  }
+  uint32_t empty() const {
+    return head.load(std::memory_order_relaxed) ==
+           tail.load(std::memory_order_relaxed);
+  }
+  uint32_t full() const {
+    return head.load(std::memory_order_relaxed) -
+               tail.load(std::memory_order_relaxed) ==
+           capacity();
+  }
+  // Guarantee that the reference will not be poped
+  T &top() const {
+    uint32_t ot = tail.load(std::memory_order_relaxed);
+    uint32_t li, si;
+    cache_line_t *cl;
+    li = ot & max_line_mask;
+    si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
+    cl = &cls[li];
+    return cl->slots[si];
+  }
+  void clear() {
+    head = tail = 0;
+    for (uint32_t li = 0; li < max_line; ++li) {
+      cls[li].hf1 = cls[li].tf1 = 0;
+      cls[li].hf2 = cls[li].tf2 = 1;
+    }
+    cls[0].hf1 = cls[0].tf1 = 1;
+  }
+  bool push(T *x) {
+    uint32_t oh = head.load(std::memory_order_acquire);
+    uint32_t li, next_li, si;
+    cache_line_t *cl;
+    do {
+      li = oh & max_line_mask;
+      si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
+      cl = &cls[li];
+      if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE &&
+                           head.load(std::memory_order_acquire) == oh))
+        return false;
+    } while (
+        !head.compare_exchange_weak(oh, oh + 1, std::memory_order_acquire));
+
+    cl->slots[si] = x;
+
+    int rep = 0;
+    while (cl->hf1 != cl->hf2) {
+      _mm_pause();
+      if (++rep == REP_COUNT) {
+        rep = 0;
+        std::this_thread::yield();
+      }
+    }
+
+    ++cl->hf2;
+    next_li = (oh + 1) & max_line_mask;
+    ++cls[next_li].hf1;
+    return true;
+  }
+  bool pop(T **x) {
+    uint32_t ot = tail.load(std::memory_order_acquire);
+    uint32_t li, next_li, si;
+    cache_line_t *cl;
+    do {
+      li = ot & max_line_mask;
+      si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
+      cl = &cls[li];
+      if (__glibc_unlikely(cl->hf2 == cl->tf2 &&
+                           tail.load(std::memory_order_acquire) == ot))
+        return false;
+    } while (
+        !tail.compare_exchange_weak(ot, ot + 1, std::memory_order_acquire));
+
+    *x = cl->slots[si];
+
+    int rep = 0;
+    while (cl->tf1 != cl->tf2) {
+      _mm_pause();
+      if (++rep == REP_COUNT) {
+        rep = 0;
+        std::this_thread::yield();
+      }
+    }
+
+    ++cl->tf2;
+    next_li = (ot + 1) & max_line_mask;
+    ++cls[next_li].tf1;
+    return true;
+  }
+
+private:
+  static const int REP_COUNT = 3;
+  static const int SLOT_MAX_INLINE = 7;
+
+  struct cache_line_t {
+    volatile uint16_t hf1, hf2, tf1, tf2;
+    T *slots[SLOT_MAX_INLINE];
+  };
+
+  cache_line_t *cls;
+  uint32_t max_line;
+  uint32_t max_size;
+  uint32_t max_line_mask;
+  uint8_t max_line_mask_bits;
+
+  std::atomic<uint32_t> head __attribute__((aligned(64)));
+  std::atomic<uint32_t> tail __attribute__((aligned(64)));
 };
 
 #endif // __CONQUEUE_H__
