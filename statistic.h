@@ -101,13 +101,7 @@ public:
 
   const std::vector<uint64_t> &get_hist() const { return hist_; }
 
-  void add_sample(D d) {
-    if (d < min_ || d >= upper_)
-      throw std::out_of_range("out of range");
-    uint32_t which_b = (d - min_) / interval_;
-    ++hist_[which_b];
-    ++count_;
-  }
+  void add_sample(D d) { add_sample_n(d, 1); }
 
   double average() const {
     double S = 0;
@@ -117,28 +111,47 @@ public:
     return S / count_;
   }
 
-  double percentage(double p) const {
-    uint64_t pd = 0;
-    uint32_t right_border = hist_.size() - 1;
-    for (uint32_t i = 0; i < hist_.size(); ++i) {
-      pd += hist_[i];
-      if (pd >= p * count_) {
-        right_border = i;
-        break;
+  double percentile(double p) const { return percentile({p})[0]; }
+
+  std::vector<double> percentile(const std::vector<double> &p) const {
+    if (p.size() == 0)
+      return {};
+
+    {
+      double pre = p.front();
+      if (pre <= 0)
+        throw "percentile can't be less than 0";
+      for (size_t i = 1; i < p.size(); ++i) {
+        if (p[i] <= pre)
+          throw "percentile arg list must be upper-sorted";
+        pre = p[i];
       }
     }
-    return (right_border + 0.5) * interval_ + min_;
+
+    size_t pi = 0;
+    uint64_t pd = 0;
+    std::vector<double> right_border(p.size(), hist_.size() - 1);
+    for (uint32_t i = 0; i < hist_.size(); ++i) {
+      pd += hist_[i];
+      if (pd >= p[pi] * count_) {
+        right_border[pi++] = i;
+        if (pi == p.size())
+          break;
+      }
+    }
+    for (size_t i = 0; i < right_border.size(); ++i) {
+      right_border[i] = (right_border[i] + 0.5) * interval_ + min_;
+    }
+    return right_border;
   }
 
   static Histogram<D> merge(Histogram<D> &h1, Histogram<D> &h2) {
     Histogram<D> nh(std::min(h1.min_, h2.min_), std::max(h1.upper_, h2.upper_),
                     std::max(h1.hist_.size(), h2.hist_.size()));
     for (uint32_t i = 0; i < h1.hist_.size(); ++i)
-      for (uint64_t j = 0; j < h1.hist_[i]; ++j)
-        nh.add_sample((i + 0.5) * h1.interval_ + h1.min_);
+      nh.add_sample_n((i + 0.5) * h1.interval_ + h1.min_, h1.hist_[i]);
     for (uint32_t i = 0; i < h2.hist_.size(); ++i)
-      for (uint64_t j = 0; j < h2.hist_[i]; ++j)
-        nh.add_sample((i + 0.5) * h2.interval_ + h2.min_);
+      nh.add_sample_n((i + 0.5) * h2.interval_ + h2.min_, h2.hist_[i]);
     return nh;
   }
 
@@ -146,6 +159,14 @@ private:
   D min_, upper_, interval_;
   uint64_t count_;
   std::vector<uint64_t> hist_;
+
+  void add_sample_n(D d, int n) {
+    if (d < min_ || d >= upper_)
+      throw std::out_of_range("out of range");
+    uint32_t which_b = (d - min_) / interval_;
+    hist_[which_b] += n;
+    count_ += n;
+  }
 };
 
 #endif // __STATISTIC_H__

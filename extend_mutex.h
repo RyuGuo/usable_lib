@@ -62,9 +62,9 @@ public:
   void wait() { pthread_barrier_wait(&b); }
 };
 
-class spin_mutex_u64 {
+class spin_mutex_b64 {
 public:
-  spin_mutex_u64() : l(0) {}
+  spin_mutex_b64() : l(0) {}
 
   void lock(uint8_t i) {
     while (1) {
@@ -87,9 +87,9 @@ private:
   std::atomic<uint64_t> l;
 };
 
-class spin_mutex_u8 {
+class spin_mutex_b8 {
 public:
-  spin_mutex_u8() : l(0) {}
+  spin_mutex_b8() : l(0) {}
 
   void lock(uint8_t i) {
     while (1) {
@@ -110,6 +110,29 @@ public:
 
 private:
   std::atomic<uint8_t> l;
+};
+
+class ticket_mutex {
+public:
+  void lock() {
+    uint32_t ct = l.fetch_add(1u << 16, std::memory_order_acquire);
+    uint16_t t = ct >> 16;
+    while (t != (ct & 0xffff)) {
+      std::this_thread::yield();
+      ct = l.load(std::memory_order_acquire);
+    }
+  }
+  bool try_lock() {
+    uint32_t ct = l.load(std::memory_order_acquire);
+    return (ct >> 16) == (ct & 0xffff) &&
+           l.compare_exchange_weak(ct, ct + (1u << 16),
+                                   std::memory_order_acquire);
+  }
+  void unlock() { l.fetch_add(1, std::memory_order_release); }
+
+private:
+  // h16: ticket, l16: cur_tick
+  std::atomic<uint32_t> l;
 };
 
 class shared_mutex_u8 {

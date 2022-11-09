@@ -26,11 +26,7 @@ private:
 
     static block_cursor_t &get_instance(const Arena *arena) {
       static thread_data tdata;
-      auto it = tdata.m_map_.find(arena);
-      if (it == tdata.m_map_.end()) {
-        it = tdata.m_map_.emplace(arena, block_cursor_t()).first;
-      }
-      return it->second;
+      return tdata.m_map_[arena];
     }
   };
 
@@ -41,10 +37,9 @@ private:
   uint32_t alloc_block() {
     uint32_t bid;
     {
-      std::unique_lock<spin_mutex_u8> q_lock(m_lck);
-      if (free_block_queue.empty()) {
+      std::unique_lock<spin_mutex_b8> q_lock(m_lck);
+      if (free_block_queue.empty())
         return -1U;
-      }
       bid = free_block_queue.back();
       free_block_queue.pop_back();
     }
@@ -57,13 +52,13 @@ private:
 public:
   char *memory_base() const { return blocks[0].base; }
 
-  Arena(char *mr, size_t nbytes) : nbytes(nbytes) {
+  Arena(char *mr, size_t nbytes) : nbytes(nbytes), is_self(false) {
     if (nbytes % block_size != 0)
       throw std::length_error(
           "`nbytes` needs to be an integer multiple of `b_size`");
     size_t bcount = (nbytes + block_size - 1) / block_size;
     blocks.resize(bcount);
-    lcks = new spin_mutex_u8[bcount];
+    lcks = new spin_mutex_b8[bcount];
     for (size_t i = 0; i < bcount; ++i) {
       Block &b = blocks[i];
       b.ref = 0;
@@ -83,10 +78,13 @@ public:
   }
 
   Arena(size_t nbytes)
-      : Arena(static_cast<char *>(::operator new(nbytes)), nbytes) {}
+      : Arena(static_cast<char *>(::operator new(nbytes)), nbytes) {
+    is_self = true;
+  }
 
   ~Arena() {
-    ::operator delete(memory_base());
+    if (is_self)
+      ::operator delete(memory_base());
     delete[] lcks;
   }
 
@@ -98,9 +96,9 @@ public:
     if (m_pos + bytes > block_size || m_pos == -1UL) {
       if (m_bid != -1U) {
         Block &m_base = blocks[m_bid];
-        std::unique_lock<spin_mutex_u8> b_lock(lcks[m_bid]);
+        std::unique_lock<spin_mutex_b8> b_lock(lcks[m_bid]);
         m_base.allocing = false;
-        if (m_base.ref != 0) {
+        if (__atomic_load_n(&m_base.ref, __ATOMIC_RELAXED) != 0) {
           b_lock.unlock();
           m_bid = alloc_block();
         }
@@ -110,9 +108,8 @@ public:
       }
       m_pos = 0;
     }
-    if (m_bid == -1U) {
+    if (m_bid == -1U)
       return nullptr;
-    }
     Block &m_base = blocks[m_bid];
     ptr = m_base.base + m_pos;
     m_pos += bytes;
@@ -126,11 +123,11 @@ public:
 
     uint32_t bid = get_ptr_to_bid(ptr);
     Block &m_base = blocks[bid];
-    std::unique_lock<spin_mutex_u8> b_lock(lcks[bid]);
+    std::unique_lock<spin_mutex_b8> b_lock(lcks[bid]);
     uint32_t cur_ref = __atomic_sub_fetch(&m_base.ref, 1, __ATOMIC_RELAXED);
     if (!m_base.allocing && cur_ref == 0) {
       b_lock.unlock();
-      std::unique_lock<spin_mutex_u8> q_lock(m_lck);
+      std::unique_lock<spin_mutex_b8> q_lock(m_lck);
       free_block_queue.push_front(bid);
     }
   }
@@ -138,10 +135,11 @@ public:
   static const size_t block_size = 4096;
 
 private:
+  bool is_self;
   size_t nbytes;
-  spin_mutex_u8 m_lck;
+  spin_mutex_b8 m_lck;
   std::vector<Block> blocks;
-  spin_mutex_u8 *lcks;
+  spin_mutex_b8 *lcks;
   std::deque<uint32_t> free_block_queue;
 };
 
