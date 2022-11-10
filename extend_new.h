@@ -63,7 +63,7 @@ template <typename T> class local_thread_specific {
 public:
   template <typename... Args>
   local_thread_specific(Args &&...args)
-      : ctor_refer(std::forward<Args>(args)...) {
+      : ctor_refer(new T(std::forward<Args>(args)...)) {
     pthread_key_create(&pkey, dtor_func);
   }
   ~local_thread_specific() { pthread_key_delete(pkey); }
@@ -98,7 +98,7 @@ public:
   T &get() {
     T *ptr = reinterpret_cast<T *>(pthread_getspecific(pkey));
     if (__glibc_unlikely(ptr == nullptr)) {
-      ptr = new T(ctor_refer);
+      ptr = new T(*ctor_refer);
       pthread_setspecific(pkey, ptr);
     }
     return *ptr;
@@ -110,7 +110,7 @@ public:
 
 private:
   pthread_key_t pkey;
-  T ctor_refer;
+  T* ctor_refer;
 
   static void dtor_func(void *p) {
     T *ptr = reinterpret_cast<T *>(p);

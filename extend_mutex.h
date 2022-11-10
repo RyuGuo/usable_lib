@@ -10,6 +10,7 @@
 #ifndef __EXTEND_MUTEX_H__
 #define __EXTEND_MUTEX_H__
 
+#include "extend_new.h"
 #include <atomic>
 #include <pthread.h>
 #include <thread>
@@ -170,6 +171,52 @@ public:
 
 private:
   std::atomic<uint8_t> l;
+};
+
+class mcs_mutex {
+public:
+  mcs_mutex() : tail(nullptr) {}
+
+  void lock() {
+    mcs_node &my_node = my_node_spe;
+    mcs_node *pred = tail.exchange(&my_node, std::memory_order_acquire);
+    if (pred != nullptr) {
+      my_node.locked = true;
+      pred->next = &my_node;
+      while (my_node.locked) {
+        std::this_thread::yield();
+      }
+    }
+  }
+  bool try_lock() {
+    mcs_node &my_node = my_node_spe;
+    mcs_node *node_ptr = nullptr;
+    return tail.compare_exchange_weak(node_ptr, &my_node,
+                                      std::memory_order_acquire);
+  }
+  void unlock() {
+    mcs_node &my_node = my_node_spe;
+    mcs_node *node_ptr = &my_node;
+    if (my_node.next == nullptr) {
+      if (tail.compare_exchange_weak(node_ptr, nullptr,
+                                     std::memory_order_release))
+        return;
+      while (my_node.next == nullptr) {
+        std::this_thread::yield();
+      }
+    }
+    my_node.next->locked = false;
+    my_node.next = nullptr;
+  }
+
+private:
+  struct mcs_node {
+    volatile bool locked = false;
+    volatile mcs_node *next = nullptr;
+  } __attribute__((aligned(64)));
+
+  local_thread_specific<mcs_node> my_node_spe __attribute__((aligned(64)));
+  std::atomic<mcs_node *> tail;
 };
 
 template <typename Mutex> class SingleFlight {
