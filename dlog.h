@@ -14,10 +14,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <errno.h>
+#include <cerrno>
 #include <pthread.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <cstring>
 
 #define DLOG_STREAM(stream, format, ...)                                       \
   do {                                                                         \
@@ -62,22 +63,22 @@
       DLOG(format, ##__VA_ARGS__);                                             \
   } while (0)
 
-inline constexpr const char *type_fmt(const char) { return "%c"; }
-inline constexpr const char *type_fmt(const short) { return "%hd"; }
-inline constexpr const char *type_fmt(const int) { return "%d"; }
-inline constexpr const char *type_fmt(const long) { return "%ld"; }
-inline constexpr const char *type_fmt(const long long) { return "%lld"; }
-inline constexpr const char *type_fmt(const unsigned char) { return "%hhu"; }
-inline constexpr const char *type_fmt(const unsigned short) { return "%hu"; }
-inline constexpr const char *type_fmt(const unsigned int) { return "%u"; }
-inline constexpr const char *type_fmt(const unsigned long) { return "%lu"; }
-inline constexpr const char *type_fmt(const unsigned long long) {
+inline constexpr const char *dlog_type_fmt(const char) { return "%c"; }
+inline constexpr const char *dlog_type_fmt(const short) { return "%hd"; }
+inline constexpr const char *dlog_type_fmt(const int) { return "%d"; }
+inline constexpr const char *dlog_type_fmt(const long) { return "%ld"; }
+inline constexpr const char *dlog_type_fmt(const long long) { return "%lld"; }
+inline constexpr const char *dlog_type_fmt(const unsigned char) { return "%hhu"; }
+inline constexpr const char *dlog_type_fmt(const unsigned short) { return "%hu"; }
+inline constexpr const char *dlog_type_fmt(const unsigned int) { return "%u"; }
+inline constexpr const char *dlog_type_fmt(const unsigned long) { return "%lu"; }
+inline constexpr const char *dlog_type_fmt(const unsigned long long) {
   return "%llu";
 }
-inline constexpr const char *type_fmt(const float) { return "%f"; }
-inline constexpr const char *type_fmt(const double) { return "%lf"; }
-inline constexpr const char *type_fmt(const long double) { return "%llf"; }
-inline constexpr const char *type_fmt(const void *) { return "%p"; }
+inline constexpr const char *dlog_type_fmt(const float) { return "%f"; }
+inline constexpr const char *dlog_type_fmt(const double) { return "%lf"; }
+inline constexpr const char *dlog_type_fmt(const long double) { return "%llf"; }
+inline constexpr const char *dlog_type_fmt(const void *) { return "%p"; }
 
 /**
  * Assert the judgment between two values.
@@ -94,7 +95,7 @@ inline constexpr const char *type_fmt(const void *) { return "%p"; }
       char fmt[] = "Because " #val_a " = %???, " #val_b " = %???";             \
       char tmp[sizeof(fmt) + 42];                                              \
       snprintf(fmt, sizeof(fmt), "Because " #val_a " = %s, " #val_b " = %s",   \
-               type_fmt(a), type_fmt(b));                                      \
+               dlog_type_fmt(a), dlog_type_fmt(b));                                      \
       snprintf(tmp, sizeof(tmp), fmt, a, b);                                   \
       DLOG_FATAL("Assertion `" #val_a " " #op " " #val_b "` failed. %s", tmp); \
     }                                                                          \

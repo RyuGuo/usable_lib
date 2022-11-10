@@ -140,7 +140,7 @@ private:
   }
 
   FutureHandle *alloc_future_handle() {
-    std::unique_lock<spin_mutex_u8> lck(fh_pool_lck);
+    std::unique_lock<spin_mutex_b8> lck(fh_pool_lck);
     if (free_fh.empty())
       return new FutureHandle();
     FutureHandle *fh = free_fh.back();
@@ -152,12 +152,12 @@ private:
   }
 
   void dealloc_future_handle(FutureHandle *fh) {
-    std::unique_lock<spin_mutex_u8> lck(fh_pool_lck);
+    std::unique_lock<spin_mutex_b8> lck(fh_pool_lck);
     free_fh.push_back(fh);
   }
 
   leader_handle *alloc_leader_handle() {
-    std::unique_lock<spin_mutex_u8> lck(lh_pool_lck);
+    std::unique_lock<spin_mutex_b8> lck(lh_pool_lck);
     if (free_lh.empty())
       return new leader_handle(max_count);
     leader_handle *lh = free_lh.back();
@@ -170,7 +170,7 @@ private:
   }
 
   void dealloc_leader_handle(leader_handle *lh) {
-    std::unique_lock<spin_mutex_u8> lck(lh_pool_lck);
+    std::unique_lock<spin_mutex_b8> lck(lh_pool_lck);
     free_lh.push_back(lh);
   }
 
@@ -302,7 +302,7 @@ public:
       hook_batch_ret_collection;
 
 private:
-  spin_mutex_u8 en_lck;
+  spin_mutex_b8 en_lck;
   shared_mutex_u8 wlck;
   volatile bool queue_valid;
   volatile uint8_t queue_ver;
@@ -315,10 +315,10 @@ private:
   std::atomic<uint32_t> queue_cnt;
 
   // Handle recycling bin
-  spin_mutex_u8 fh_pool_lck;
+  spin_mutex_b8 fh_pool_lck;
   std::vector<FutureHandle *> free_fh;
   char padding[64 - sizeof(fh_pool_lck) - sizeof(free_fh)];
-  spin_mutex_u8 lh_pool_lck;
+  spin_mutex_b8 lh_pool_lck;
   std::vector<leader_handle *> free_lh;
 };
 

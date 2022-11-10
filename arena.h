@@ -2,6 +2,7 @@
 #define __ARENA_H__
 
 #include "extend_mutex.h"
+#include "extend_new.h"
 #include <cstdlib>
 #include <deque>
 #include <mutex>
@@ -20,14 +21,6 @@ private:
   struct block_cursor_t {
     uint32_t m_bid = -1U;
     size_t m_pos = -1U;
-  };
-  struct thread_data {
-    std::unordered_map<const Arena *, block_cursor_t> m_map_;
-
-    static block_cursor_t &get_instance(const Arena *arena) {
-      static thread_data tdata;
-      return tdata.m_map_[arena];
-    }
   };
 
   uint32_t get_ptr_to_bid(const char *ptr) const {
@@ -89,30 +82,29 @@ public:
   }
 
   char *allocate(size_t bytes) {
-    auto &m_bid = thread_data::get_instance(this).m_bid;
-    auto &m_pos = thread_data::get_instance(this).m_pos;
+    block_cursor_t &bc = this->bc;
 
     char *ptr;
-    if (m_pos + bytes > block_size || m_pos == -1UL) {
-      if (m_bid != -1U) {
-        Block &m_base = blocks[m_bid];
-        std::unique_lock<spin_mutex_b8> b_lock(lcks[m_bid]);
+    if (bc.m_pos + bytes > block_size || bc.m_pos == -1UL) {
+      if (bc.m_bid != -1U) {
+        Block &m_base = blocks[bc.m_bid];
+        std::unique_lock<spin_mutex_b8> b_lock(lcks[bc.m_bid]);
         m_base.allocing = false;
         if (__atomic_load_n(&m_base.ref, __ATOMIC_RELAXED) != 0) {
           b_lock.unlock();
-          m_bid = alloc_block();
+          bc.m_bid = alloc_block();
         }
         // else reuse m_bid
       } else {
-        m_bid = alloc_block();
+        bc.m_bid = alloc_block();
       }
-      m_pos = 0;
+      bc.m_pos = 0;
     }
-    if (m_bid == -1U)
+    if (bc.m_bid == -1U)
       return nullptr;
-    Block &m_base = blocks[m_bid];
-    ptr = m_base.base + m_pos;
-    m_pos += bytes;
+    Block &m_base = blocks[bc.m_bid];
+    ptr = m_base.base + bc.m_pos;
+    bc.m_pos += bytes;
     __atomic_fetch_add(&m_base.ref, 1, __ATOMIC_RELAXED);
     return ptr;
   }
@@ -136,8 +128,9 @@ public:
 
 private:
   bool is_self;
-  size_t nbytes;
   spin_mutex_b8 m_lck;
+  local_thread_specific<block_cursor_t> bc;
+  size_t nbytes;
   std::vector<Block> blocks;
   spin_mutex_b8 *lcks;
   std::deque<uint32_t> free_block_queue;

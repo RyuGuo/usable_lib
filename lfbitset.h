@@ -115,7 +115,7 @@ public:
     }
     return -1;
   }
-  uint64_t *to_ulong() { return (uint64_t *)bitword; }
+  const uint64_t *to_ulong() { return (const uint64_t *)bitword; }
 
   void reset_bulk(uint64_t i, uint64_t n) {
     uint64_t s = i / 64, e = (i + n) / 64;
@@ -208,7 +208,7 @@ public:
     return -1;
   }
 
-  uint64_t *to_ulong() { return (uint64_t *)&bitword; }
+  const uint64_t *to_ulong() { return (const uint64_t *)&bitword; }
 
   uint64_t ffs_and_set_bulk(int n) {
     if (n == 1)

@@ -7,9 +7,9 @@
 
 namespace mm_allocator {
 void env_init(void *addr, size_t max_size,
-              void (*mm_flush)(void *ptr, size_t size), void (*mm_drain)());
+              void (*mm_flush)(const void *ptr, size_t size), void (*mm_drain)());
 void env_recovery(void *addr, size_t max_size,
-                  void (*mm_flush)(void *ptr, size_t size), void (*mm_drain)());
+                  void (*mm_flush)(const void *ptr, size_t size), void (*mm_drain)());
 void env_release();
 
 void *mm_ptr_at(uint64_t off);

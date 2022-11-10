@@ -2,6 +2,7 @@
 #define __EXTEND_NEW_H__
 
 #include <cstdlib>
+#include <pthread.h>
 #include <utility>
 
 template <typename T, size_t ALIGN, typename... Args>
@@ -55,6 +56,65 @@ struct __flexible_array_impl__ final : public T {
         reinterpret_cast<FT *>(reinterpret_cast<char *>(this) + FT_OFFSET);
     for (size_t i = 0; i < n; ++i)
       fla_ptr[i].~FT();
+  }
+};
+
+template <typename T> class local_thread_specific {
+public:
+  template <typename... Args>
+  local_thread_specific(Args &&...args)
+      : ctor_refer(std::forward<Args>(args)...) {
+    pthread_key_create(&pkey, dtor_func);
+  }
+  ~local_thread_specific() { pthread_key_delete(pkey); }
+
+  local_thread_specific(const local_thread_specific &) = delete;
+  local_thread_specific(local_thread_specific &&) = delete;
+  local_thread_specific &operator=(const local_thread_specific &) = delete;
+  local_thread_specific &operator=(local_thread_specific &&) = delete;
+
+  T &set(const T &x) {
+    T *ptr = reinterpret_cast<T *>(pthread_getspecific(pkey));
+    if (ptr == nullptr) {
+      ptr = new T(x);
+      pthread_setspecific(pkey, ptr);
+    } else {
+      (*ptr).~T();
+      new (ptr) T(x);
+    }
+    return *ptr;
+  }
+  T &set(T &&x) {
+    T *ptr = reinterpret_cast<T *>(pthread_getspecific(pkey));
+    if (__glibc_unlikely(ptr == nullptr)) {
+      ptr = new T(std::forward<T>(x));
+      pthread_setspecific(pkey, ptr);
+    } else {
+      (*ptr).~T();
+      new (ptr) T(std::forward<T>(x));
+    }
+    return *ptr;
+  }
+  T &get() {
+    T *ptr = reinterpret_cast<T *>(pthread_getspecific(pkey));
+    if (__glibc_unlikely(ptr == nullptr)) {
+      ptr = new T(ctor_refer);
+      pthread_setspecific(pkey, ptr);
+    }
+    return *ptr;
+  }
+
+  T &operator=(const T &x) { return set(x); }
+  T &operator=(T &&x) { return set(std::move(x)); }
+  operator T &() { return get(); }
+
+private:
+  pthread_key_t pkey;
+  T ctor_refer;
+
+  static void dtor_func(void *p) {
+    T *ptr = reinterpret_cast<T *>(p);
+    delete ptr;
   }
 };
 

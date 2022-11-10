@@ -23,15 +23,15 @@
 using chunk_id_t = uint64_t;
 using block_id_t = uint64_t; // start at 1
 
-static void (*MM_FLUSH)(void *ptr, size_t size);
+static void (*MM_FLUSH)(const void *ptr, size_t size);
 static void (*MM_DRAIN)();
 
 template <typename T> static void mm_obj_sync(T *e) {
-  MM_FLUSH((void *)e, sizeof(T));
+  MM_FLUSH((const void *)e, sizeof(T));
   MM_DRAIN();
 }
 template <typename T> static void mm_obj_sync_nodrain(T *e) {
-  MM_FLUSH((void *)e, sizeof(T));
+  MM_FLUSH((const void *)e, sizeof(T));
 }
 template <typename T> static void obj_clr(T &e) { memset(&e, 0, sizeof(T)); }
 template <typename A, typename B> constexpr static A ceil(A a, B b) {
@@ -261,7 +261,7 @@ static dram_block_meta *block_metas;
 static thread_local theap_s theap;
 
 void mm_allocator::env_init(void *addr, size_t max_size,
-                            void (*mm_flush)(void *ptr, size_t size),
+                            void (*mm_flush)(const void *ptr, size_t size),
                             void (*mm_drain)()) {
   if (STATUS)
     return;
@@ -361,7 +361,7 @@ void mm_allocator::env_init(void *addr, size_t max_size,
 }
 
 void env_recovery(void *addr, size_t max_size,
-                  void (*mm_flush)(void *ptr, size_t size),
+                  void (*mm_flush)(const void *ptr, size_t size),
                   void (*mm_drain)()) {
   if (STATUS)
     return;
