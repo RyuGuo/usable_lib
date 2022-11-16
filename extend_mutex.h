@@ -173,6 +173,38 @@ private:
   std::atomic<uint8_t> l;
 };
 
+struct intention_mutex {
+  intention_mutex() : l(0) {}
+
+  void lock_shared() {
+    uint8_t o = l.load(std::memory_order_acquire);
+    while (1) {
+      if (o & 1) {
+        std::this_thread::yield();
+        o = l.load(std::memory_order_acquire);
+      } else if (l.compare_exchange_weak(o, o + 2, std::memory_order_acquire)) {
+        break;
+      }
+    }
+  }
+
+  bool try_lock_prompt() {
+    uint8_t o = l.fetch_or(1, std::memory_order_acquire);
+    if (o & 1)
+      return false;
+    unlock_shared();
+    while (l.load(std::memory_order_acquire) & ~(1)) {
+    }
+    return true;
+  }
+
+  void unlock() { l.store(0, std::memory_order_release); }
+  void unlock_shared() { l.fetch_sub(2, std::memory_order_release); }
+
+private:
+  std::atomic<uint8_t> l;
+};
+
 class mcs_mutex {
 public:
   mcs_mutex() : tail(nullptr) {}

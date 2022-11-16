@@ -289,9 +289,9 @@ private:
   uint32_t count_mask;
   uint32_t max_size;
 
-  volatile po_val_t prod_head __attribute__((aligned(64)));
+  volatile po_val_t prod_head;
   volatile po_val_t prod_tail;
-  volatile po_val_t cons_head __attribute__((aligned(64)));
+  __attribute__((aligned(64))) volatile po_val_t cons_head;
   volatile po_val_t cons_tail;
 
   static const int REP_COUNT = 3;
@@ -341,182 +341,6 @@ private:
       std::this_thread::yield();
     }
   }
-};
-
-template <typename T, template <typename _T> class Alloc = std::allocator>
-class ConQueueEX {
-public:
-  ConQueueEX(uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                              ConQueueMode::F_MC_HTS_DEQ)
-      : flags(flags), size_(0), head(copyable_pair{nullptr, 0}) {
-    node *dummy = Alloc<node>().allocate(1);
-    dummy->next = nullptr;
-    head.store(copyable_pair{dummy, 0}, std::memory_order_relaxed);
-    tail = dummy;
-  }
-  ~ConQueueEX() {
-    clear();
-    node *dummy = head.load(std::memory_order_relaxed).first;
-    Alloc<node>().deallocate(dummy, 1);
-  }
-
-  uint32_t capacity() const { return size_.load(std::memory_order_relaxed); }
-  uint32_t size() const { return size_.load(std::memory_order_relaxed); }
-  bool empty() const { return size_.load(std::memory_order_relaxed) == 0; }
-  bool full() const { return false; }
-  // Guarantee that the reference will not be poped
-  T &top() const {
-    return head.load(std::memory_order_relaxed).frist->next->item;
-  }
-  void clear() {
-    node *dummy = head.load(std::memory_order_relaxed).first;
-    node *next = const_cast<node *>(dummy->next);
-    dummy->next = nullptr;
-    head.store(copyable_pair{dummy, 0}, std::memory_order_relaxed);
-    while (next) {
-      next->item.~T();
-      auto tmp = const_cast<node *>(next->next);
-      Alloc<node>().deallocate(next, 1);
-      next = tmp;
-    }
-    size_ = 0;
-  }
-  bool push(const T &__x) {
-    node *n = Alloc<node>().allocate(1);
-    new (&n->item) T(__x);
-    n->next = nullptr;
-    node *taild = tail.exchange(n, std::memory_order_acquire);
-    taild->next = n;
-    ++size_;
-    return true;
-  }
-  bool push(T &&__x) { return emplace(std::move(__x)); }
-  template <typename... Args> bool emplace(Args &&...args) {
-    node *n = Alloc<node>().allocate(1);
-    new (&n->item) T(std::forward<Args>(args)...);
-    n->next = nullptr;
-    node *taild = tail.exchange(n, std::memory_order_acquire);
-    taild->next = n;
-    ++size_;
-    return true;
-  }
-  template <typename Iter> uint32_t push_bulk(Iter first, Iter last) {
-    uint32_t count = std::distance(first, last);
-    if (count == 0)
-      return 0;
-    node *firstn, *lastn, *last_prev;
-    firstn = last_prev = lastn = Alloc<node>().allocate(1);
-    new (&firstn->item) T(*(first++));
-    for (uint32_t i = 1; i < count; ++i) {
-      lastn = Alloc<node>().allocate(1);
-      new (&lastn->item) T(*(first++));
-      last_prev->next = lastn;
-      last_prev = lastn;
-    }
-    lastn->next = nullptr;
-
-    node *taild = tail.exchange(lastn, std::memory_order_acquire);
-    taild->next = firstn;
-    size_ += count;
-    return count;
-  }
-  bool pop(T *__x) {
-    copyable_pair headd;
-    if (flags & ConQueueMode::F_SC_DEQ) {
-      headd = head.load(std::memory_order_relaxed);
-      node *next = const_cast<node *>(headd.first->next);
-      if (next == nullptr)
-        return false;
-      head.store(copyable_pair{next, headd.second + 1},
-                 std::memory_order_relaxed);
-      new (__x) T(std::move(next->item));
-      next->item.~T();
-      --size_;
-      Alloc<node>().deallocate(headd.first, 1);
-      return true;
-    } else {
-      while (1) {
-        headd = head.load(std::memory_order_acquire);
-        node *next = const_cast<node *>(headd.first->next);
-        if (next == nullptr)
-          return false;
-
-        if (head.compare_exchange_weak(headd,
-                                       copyable_pair{next, headd.second + 1}),
-            std::memory_order_acquire) {
-          new (__x) T(std::move(next->item));
-          next->item.~T();
-          --size_;
-          Alloc<node>().deallocate(headd.first, 1);
-          return true;
-        }
-        std::this_thread::yield();
-      }
-    }
-  }
-  template <typename Iter> uint32_t pop_bulk(Iter first, Iter last) {
-    uint32_t count = std::distance(first, last);
-    uint32_t l;
-    copyable_pair headd;
-    if (flags & ConQueueMode::F_SC_DEQ) {
-      headd = head.load(std::memory_order_relaxed);
-      node *next = const_cast<node *>(headd.first->next),
-           *next_last = headd.first;
-      for (l = 0; l < count && next_last->next != nullptr;
-           next_last = const_cast<node *>(next_last->next), ++l)
-        ;
-      head.store(copyable_pair{next_last, headd.second + 1},
-                 std::memory_order_relaxed);
-      node *p = headd.first;
-      for (uint32_t i = 0; i < l; ++i) {
-        new (&*(first++)) T(p->next->item);
-        p->next->item.~T();
-        auto tmp = const_cast<node *>(p->next);
-        Alloc<node>().deallocate(p, 1);
-        p = tmp;
-      }
-    } else {
-      while (1) {
-        headd = head.load(std::memory_order_acquire);
-        node *next = const_cast<node *>(headd.first->next),
-             *next_last = headd.first;
-        for (l = 0; l < count && next_last->next != nullptr;
-             next_last = const_cast<node *>(next_last->next), ++l)
-          ;
-        if (head.compare_exchange_weak(
-                headd, copyable_pair{next_last, headd.second + 1}),
-            std::memory_order_acquire) {
-          node *p = headd.first;
-          for (uint32_t i = 0; i < l; ++i) {
-            new (&*(first++)) T(p->next->item);
-            p->next->item.~T();
-            auto tmp = const_cast<node *>(p->next);
-            Alloc<node>().deallocate(p, 1);
-            p = tmp;
-          }
-          break;
-        }
-        std::this_thread::yield();
-      }
-    }
-    size_ -= l;
-    return l;
-  }
-
-private:
-  struct node {
-    volatile node *next;
-    T item;
-  };
-  struct copyable_pair {
-    node *first;
-    uint64_t second;
-  };
-
-  uint32_t flags;
-  std::atomic<uint32_t> size_;
-  std::atomic<node *> tail;
-  std::atomic<copyable_pair> head;
 };
 
 template <typename T> class CmQueue {
@@ -573,7 +397,6 @@ public:
     cache_line_t *cl;
     do {
       li = oh & max_line_mask;
-      si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
       cl = &cls[li];
       if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE &&
                            head.load(std::memory_order_acquire) == oh))
@@ -581,6 +404,7 @@ public:
     } while (
         !head.compare_exchange_weak(oh, oh + 1, std::memory_order_acquire));
 
+    si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
     cl->slots[si] = x;
 
     int rep = 0;
@@ -603,7 +427,6 @@ public:
     cache_line_t *cl;
     do {
       li = ot & max_line_mask;
-      si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
       cl = &cls[li];
       if (__glibc_unlikely(cl->hf2 == cl->tf2 &&
                            tail.load(std::memory_order_acquire) == ot))
@@ -611,6 +434,7 @@ public:
     } while (
         !tail.compare_exchange_weak(ot, ot + 1, std::memory_order_acquire));
 
+    si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
     *x = cl->slots[si];
 
     int rep = 0;
@@ -643,8 +467,220 @@ private:
   uint32_t max_line_mask;
   uint8_t max_line_mask_bits;
 
-  std::atomic<uint32_t> head __attribute__((aligned(64)));
-  std::atomic<uint32_t> tail __attribute__((aligned(64)));
+  std::atomic<uint32_t> head;
+  __attribute__((aligned(64))) std::atomic<uint32_t> tail;
+};
+
+#include "extend_mutex.h"
+
+template <typename T> struct MpScNoRestrictBoundedQueue {
+  MpScNoRestrictBoundedQueue(uint32_t init_size = 65536) : cons(0) {
+    if (check_little_endian()) {
+      w_.li.max_size = init_size;
+      w_.li.arr = new T[init_size];
+    } else {
+      w_.bi.max_size = init_size;
+      w_.bi.arr = new T[init_size];
+    }
+    prod_head.raw = prod_tail.raw = 0;
+  }
+  ~MpScNoRestrictBoundedQueue() {
+    clear();
+    if (check_little_endian()) {
+      delete[] w_.li.arr;
+    } else {
+      delete[] w_.bi.arr;
+    }
+  }
+
+  uint32_t capacity() const { return get_max_size(); }
+  uint32_t size() const { return prod_tail.pos - cons; }
+  bool empty() const { return prod_tail.pos == cons; }
+  bool full() const { return false; }
+  // Guarantee that the reference will not be poped
+  T &top() const {
+    auto p = get_word_pair();
+    return p.first[prod_tail.pos % p.second];
+  }
+  void clear() {
+    auto p = get_word_pair();
+    uint32_t t = prod_tail.pos;
+    for (uint32_t j = cons; j != t; ++j) {
+      p.first[j % p.second].~T();
+    }
+    prod_tail.pos = prod_head.pos = cons = 0;
+  }
+
+  // No sequentially consistency, i.e. the elements of the push may not be
+  // visible when the thread is popped. This is a better solution for
+  // high performance.
+  bool push(const T &x) {
+    po_val_t oh;
+    oh.raw =
+        __atomic_fetch_add(&prod_head.raw, (1ul << 32) | 1ul, __ATOMIC_ACQUIRE);
+    uint32_t i = oh.pos;
+
+    expand_lck_.lock_shared();
+
+  retry:
+    if (__glibc_unlikely(i - cons >= get_max_size())) {
+      if (!expand_lck_.try_lock_prompt()) {
+        expand_lck_.unlock_shared();
+        uint64_t o = get_max_size();
+        while (i - cons >= get_max_size() && o == get_max_size()) {
+          std::this_thread::yield();
+        }
+        expand_lck_.lock_shared();
+        goto retry;
+      }
+      if (i - cons >= get_max_size()) {
+        auto p = get_word_pair();
+        uint32_t old_size = p.second;
+        T *old_arr = p.first;
+
+        uint32_t new_size = get_max_size() << 1;
+        T *new_arr = new T[new_size];
+
+        // The other threads with `oh.pos >= i` are not assigning element to the
+        // queue at this time. And other threads with `oh.pos < i` have assigned
+        // element to the queue.
+
+        for (uint32_t j = i - 1; j != cons - 1; --j) {
+          new_arr[j % new_size] = old_arr[j % old_size];
+        }
+        update_arr_and_size(new_arr, new_size);
+        delete[] old_arr;
+      }
+      expand_lck_.unlock();
+
+      goto retry;
+    }
+
+    new (&get_arr()[i % get_max_size()]) T(x);
+
+    // use rts mode to remove dead lock
+    rts_update_ht(&prod_head, &prod_tail);
+    expand_lck_.unlock_shared();
+
+    return true;
+  }
+
+  // single-thread pop.
+  // ensure the queue is not empty before call it.
+  bool pop(T *x) {
+    // need thread-fence, otherwise `arr` and `max_size` is inconsistent.
+    auto p = get_word_pair();
+    *x = std::move(p.first[cons % p.second]);
+    ++cons;
+    return true;
+  }
+
+  union po_val_t {
+    struct {
+      uint32_t pos;
+      uint32_t cnt;
+    };
+    uint64_t raw;
+  };
+
+  union word {
+    union {
+      struct {
+        T *arr;
+        uint32_t max_size;
+        uint32_t __padding__;
+      };
+      uint32_t raw[4];
+    } bi;
+    union {
+      struct {
+        uint32_t __padding__;
+        uint32_t max_size;
+        T *arr;
+      };
+      uint32_t raw[4];
+    } li;
+  };
+
+  T *get_arr() const volatile {
+    if (check_little_endian()) {
+      return w_.li.arr;
+    } else {
+      return w_.bi.arr;
+    }
+  }
+
+  uint32_t get_max_size() const volatile {
+    if (check_little_endian()) {
+      return w_.li.max_size;
+    } else {
+      return w_.bi.max_size;
+    }
+  }
+
+  // load `arr` and `max_size` together
+  std::pair<T *, uint32_t> get_word_pair() const volatile {
+    if (check_little_endian()) {
+      return {w_.li.arr, w_.li.max_size};
+    } else {
+      return {w_.bi.arr, w_.bi.max_size};
+    }
+  }
+
+  // In order to achieve atomic update of `arr` pointer and `max_size`,
+  // it is necessary to determine the system endian node and update both in 64
+  // bits if possible, because `__atomic_store_16` is slower than
+  // `__atomic_store_n`.
+  void update_arr_and_size(T *new_arr, uint32_t new_size) {
+    if (check_little_endian()) {
+      if ((((uint64_t)new_arr) >> 32) == (((uint64_t)get_arr()) >> 32)) {
+        __atomic_store_n((uint64_t *)(&w_.li.raw[1]),
+                         (((uint64_t)new_arr) << 32) | new_size,
+                         __ATOMIC_RELAXED);
+      } else {
+        word nw;
+        nw.li.arr = new_arr;
+        nw.li.max_size = new_size;
+        __atomic_store(&w_, &nw, __ATOMIC_RELAXED);
+      }
+    } else {
+      // TODO ...
+      word nw;
+      nw.bi.arr = new_arr;
+      nw.bi.max_size = new_size;
+      __atomic_store(&w_, &nw, __ATOMIC_RELAXED);
+    }
+  }
+
+  static bool check_little_endian() {
+    union judge_u {
+      int a;
+      char b;
+    };
+    judge_u u = {};
+    u.a = 0x12345678;
+    return 0x78 == u.b;
+  }
+
+  static void rts_update_ht(volatile po_val_t *ht, volatile po_val_t *ht_) {
+    po_val_t h, oh, nh;
+    oh.raw = __atomic_load_n(&ht_->raw, __ATOMIC_ACQUIRE);
+    while (1) {
+      h.raw = __atomic_load_n(&ht->raw, __ATOMIC_RELAXED);
+      nh.raw = oh.raw;
+      if ((++nh.cnt) == h.cnt)
+        nh.pos = h.pos;
+      if (__atomic_compare_exchange_n(&ht_->raw, &oh.raw, nh.raw, true,
+                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+        break;
+      std::this_thread::yield();
+    }
+  }
+
+  word w_;
+  intention_mutex expand_lck_;
+  volatile po_val_t prod_head, prod_tail;
+  __attribute__((aligned(64))) volatile uint32_t cons;
 };
 
 #endif // __CONQUEUE_H__

@@ -2,3 +2,4 @@
 test.cc
 *.o
 *.out
+queue-bench/bench
