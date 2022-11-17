@@ -36,22 +36,24 @@ public:
       throw "ring array is null";
     if (max_size == 0)
       throw "max_size is 0";
-    if ((flags & F_SP_ENQ) && (flags & (F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
+    if ((this->flags & F_SP_ENQ) &&
+        (this->flags & (F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
       throw "queue producer flag error";
-    if ((flags & F_MP_RTS_ENQ) && (flags & F_MP_HTS_ENQ))
+    if ((this->flags & F_MP_RTS_ENQ) && (this->flags & F_MP_HTS_ENQ))
       throw "queue producer flag error";
-    if ((flags & F_SC_DEQ) && (flags & (F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
+    if ((this->flags & F_SC_DEQ) &&
+        (this->flags & (F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
       throw "queue consumer flag error";
-    if ((flags & F_MC_RTS_DEQ) && (flags & F_MC_HTS_DEQ))
+    if ((this->flags & F_MC_RTS_DEQ) && (this->flags & F_MC_HTS_DEQ))
       throw "queue consumer flag error";
 
     // default flag set
-    if (!(flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
-      flags |= F_MP_HTS_ENQ;
-    if (!(flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
-      flags |= F_MC_HTS_DEQ;
+    if (!(this->flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
+      this->flags |= F_MP_HTS_ENQ;
+    if (!(this->flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
+      this->flags |= F_MC_HTS_DEQ;
 
-    count_mask = aligned_size(max_size, flags) - 1;
+    count_mask = aligned_size(max_size, this->flags) - 1;
   }
   ConQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
                                                ConQueueMode::F_MC_HTS_DEQ)
@@ -345,7 +347,24 @@ private:
 
 template <typename T> class CmQueue {
 public:
-  CmQueue(uint32_t max_size) {
+  CmQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
+                                              ConQueueMode::F_MC_HTS_DEQ)
+      : flags(flags) {
+    if (max_size == 0)
+      throw "max_size is 0";
+    if ((this->flags & F_MP_HTS_ENQ) && (this->flags & F_MP_RTS_ENQ))
+      throw "queue producer flag error";
+    if ((this->flags & F_MC_RTS_DEQ) && (this->flags & F_MC_HTS_DEQ))
+      throw "queue consumer flag error";
+    if (this->flags & F_EXACT_SZ)
+      throw "queue exacting size is not supported";
+
+    // default flag set
+    if (!(this->flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
+      this->flags |= F_MP_HTS_ENQ;
+    if (!(this->flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
+      this->flags |= F_MC_HTS_DEQ;
+
     // find max_size = SLOT_MAX_INLINE * 2^n
     uint32_t s = SLOT_MAX_INLINE;
     while (s < max_size)
@@ -379,8 +398,8 @@ public:
     uint32_t li, si;
     cache_line_t *cl;
     li = ot & max_line_mask;
-    si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
     cl = &cls[li];
+    si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
     return cl->slots[si];
   }
   void clear() {
@@ -392,63 +411,93 @@ public:
     cls[0].hf1 = cls[0].tf1 = 1;
   }
   bool push(T *x) {
-    uint32_t oh = head.load(std::memory_order_acquire);
     uint32_t li, next_li, si;
     cache_line_t *cl;
-    do {
+    if (flags & F_SP_ENQ) {
+      uint32_t oh = head.fetch_add(1, std::memory_order_relaxed);
       li = oh & max_line_mask;
       cl = &cls[li];
       if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE &&
-                           head.load(std::memory_order_acquire) == oh))
+                           head.load(std::memory_order_acquire) == oh)) {
+        head.fetch_sub(1, std::memory_order_relaxed);
         return false;
-    } while (
-        !head.compare_exchange_weak(oh, oh + 1, std::memory_order_acquire));
+      }
+      si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
+      cl->slots[si] = x;
+    } else {
+      uint32_t oh = head.load(std::memory_order_acquire);
+      do {
+        li = oh & max_line_mask;
+        cl = &cls[li];
+        if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE &&
+                             head.load(std::memory_order_acquire) == oh))
+          return false;
+      } while (
+          !head.compare_exchange_weak(oh, oh + 1, std::memory_order_acquire));
 
-    si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
-    cl->slots[si] = x;
+      si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
+      cl->slots[si] = x;
 
-    int rep = 0;
-    while (cl->hf1 != cl->hf2) {
-      _mm_pause();
-      if (++rep == REP_COUNT) {
-        rep = 0;
-        std::this_thread::yield();
+      if (flags & F_MP_HTS_ENQ) {
+        int rep = 0;
+        while (cl->hf1 != cl->hf2) {
+          _mm_pause();
+          if (++rep == REP_COUNT) {
+            rep = 0;
+            std::this_thread::yield();
+          }
+        }
+        next_li = (oh + 1) & max_line_mask;
+        ++cls[next_li].hf1;
       }
     }
 
     ++cl->hf2;
-    next_li = (oh + 1) & max_line_mask;
-    ++cls[next_li].hf1;
     return true;
   }
   bool pop(T **x) {
-    uint32_t ot = tail.load(std::memory_order_acquire);
     uint32_t li, next_li, si;
     cache_line_t *cl;
-    do {
+    if (flags & F_SC_DEQ) {
+      uint32_t ot = tail.fetch_add(1, std::memory_order_relaxed);
       li = ot & max_line_mask;
       cl = &cls[li];
       if (__glibc_unlikely(cl->hf2 == cl->tf2 &&
-                           tail.load(std::memory_order_acquire) == ot))
+                           tail.load(std::memory_order_acquire) == ot)) {
+        tail.fetch_sub(1, std::memory_order_relaxed);
         return false;
-    } while (
-        !tail.compare_exchange_weak(ot, ot + 1, std::memory_order_acquire));
+      }
+      si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
+      *x = cl->slots[si];
+    } else {
+      uint32_t ot = tail.load(std::memory_order_acquire);
+      do {
+        li = ot & max_line_mask;
+        cl = &cls[li];
+        if (__glibc_unlikely(cl->hf2 == cl->tf2 &&
+                             tail.load(std::memory_order_acquire) == ot))
+          return false;
+      } while (
+          !tail.compare_exchange_weak(ot, ot + 1, std::memory_order_acquire));
 
-    si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
-    *x = cl->slots[si];
+      si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
+      *x = cl->slots[si];
 
-    int rep = 0;
-    while (cl->tf1 != cl->tf2) {
-      _mm_pause();
-      if (++rep == REP_COUNT) {
-        rep = 0;
-        std::this_thread::yield();
+      if (flags & F_MC_HTS_DEQ) {
+        int rep = 0;
+        while (cl->tf1 != cl->tf2) {
+          _mm_pause();
+          if (++rep == REP_COUNT) {
+            rep = 0;
+            std::this_thread::yield();
+          }
+        }
+        next_li = (ot + 1) & max_line_mask;
+        ++cls[next_li].tf1;
       }
     }
 
     ++cl->tf2;
-    next_li = (ot + 1) & max_line_mask;
-    ++cls[next_li].tf1;
     return true;
   }
 
@@ -461,6 +510,7 @@ private:
     T *slots[SLOT_MAX_INLINE];
   };
 
+  uint32_t flags;
   cache_line_t *cls;
   uint32_t max_line;
   uint32_t max_size;
