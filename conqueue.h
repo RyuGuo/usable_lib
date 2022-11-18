@@ -73,54 +73,32 @@ public:
   // Guarantee that the reference will not be poped
   T &top() const { return ring[cons_tail.pos]; }
   void clear() {
-    uint32_t _h = prod_head.pos, _t = cons_head.pos;
+    uint32_t _h = prod_tail.pos, _t = cons_tail.pos;
     for (uint32_t i = _t; i != _h; ++i) {
       ring[to_id(i)].~T();
     }
     prod_head.pos = prod_tail.pos = cons_head.pos = cons_tail.pos = 0;
   }
-  bool push(const T &__x) {
-    if (flags & ConQueueMode::F_SP_ENQ) {
-      if (__glibc_unlikely(prod_head.pos - cons_tail.pos == capacity()))
-        return false;
-
-      new (&ring[to_id(prod_head.pos)]) T(__x);
-
-      ++prod_head.pos;
-      ++prod_tail.pos;
-    } else {
-      union po_val_t oh, nh;
-      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
-      do {
-        if (__glibc_unlikely(oh.pos - cons_tail.pos == capacity()))
-          return false;
-        nh.pos = oh.pos + 1;
-        if (flags & ConQueueMode::F_MP_RTS_ENQ)
-          nh.cnt = oh.cnt + 1;
-      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
-                                            true, __ATOMIC_ACQUIRE,
-                                            __ATOMIC_ACQUIRE));
-
-      new (&ring[to_id(oh.pos)]) T(__x);
-
-      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
-        hts_update_ht(&prod_tail, 1, oh.pos);
-      } else {
-        rts_update_ht(&prod_head, &prod_tail);
-      }
-    }
-    return true;
-  }
-  bool push(T &&__x) { return emplace(std::move(__x)); }
+  bool push(const T &x) { return emplace(std::forward<const T &>(x)); }
+  bool push(T &&x) { return emplace(std::forward<T>(x)); }
   template <typename... Args> bool emplace(Args &&...args) {
     if (flags & ConQueueMode::F_SP_ENQ) {
-      if (__glibc_unlikely(prod_head.pos - cons_tail.pos == capacity()))
+      if (__glibc_unlikely(prod_tail.pos - cons_tail.pos == capacity()))
         return false;
-
-      new (&ring[to_id(prod_head.pos)]) T(std::forward<Args>(args)...);
-
-      ++prod_head.pos;
+      new (&ring[to_id(prod_tail.pos)]) T(std::forward<Args>(args)...);
       ++prod_tail.pos;
+    } else if (flags & ConQueueMode::F_MP_HTS_ENQ) {
+      union po_val_t oh, nh;
+      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
+      do {
+        if (__glibc_unlikely(oh.pos - cons_tail.pos == capacity()))
+          return false;
+        nh.pos = oh.pos + 1;
+      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+      new (&ring[to_id(oh.pos)]) T(std::forward<Args>(args)...);
+      hts_update_ht(&prod_tail, 1, oh.pos);
     } else {
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
@@ -128,19 +106,12 @@ public:
         if (__glibc_unlikely(oh.pos - cons_tail.pos == capacity()))
           return false;
         nh.pos = oh.pos + 1;
-        if (flags & ConQueueMode::F_MP_RTS_ENQ)
-          nh.cnt = oh.cnt + 1;
+        nh.cnt = oh.cnt + 1;
       } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
                                             true, __ATOMIC_ACQUIRE,
                                             __ATOMIC_ACQUIRE));
-
       new (&ring[to_id(oh.pos)]) T(std::forward<Args>(args)...);
-
-      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
-        hts_update_ht(&prod_tail, 1, oh.pos);
-      } else {
-        rts_update_ht(&prod_head, &prod_tail);
-      }
+      rts_update_ht(&prod_head, &prod_tail);
     }
     return true;
   }
@@ -155,12 +126,26 @@ public:
     uint32_t l;
     uint32_t count = std::distance(first, last);
     if (flags & ConQueueMode::F_SP_ENQ) {
-      l = std::min(capacity() - prod_head.pos + cons_tail.pos, count);
+      l = std::min(capacity() - prod_tail.pos + cons_tail.pos, count);
       for (uint32_t i = 0; i < l; ++i) {
-        new (&ring[to_id(prod_head.pos + i)]) T(*(first++));
+        new (&ring[to_id(prod_tail.pos + i)]) T(*(first++));
       }
-      prod_head.pos += l;
       prod_tail.pos += l;
+    } else if (flags & ConQueueMode::F_MP_RTS_ENQ) {
+      union po_val_t oh, nh;
+      oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
+      do {
+        l = std::min(capacity() - oh.pos + cons_tail.pos, count);
+        if (l == 0)
+          return 0;
+        nh.pos = oh.pos + l;
+      } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+      for (uint32_t i = 0; i < l; ++i) {
+        new (&ring[to_id(oh.pos + i)]) T(*(first++));
+      }
+      hts_update_ht(&prod_tail, l, oh.pos);
     } else {
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
@@ -169,34 +154,39 @@ public:
         if (l == 0)
           return 0;
         nh.pos = oh.pos + l;
-        if (flags & ConQueueMode::F_MP_RTS_ENQ)
-          nh.cnt = oh.cnt + 1;
+        nh.cnt = oh.cnt + 1;
       } while (!__atomic_compare_exchange_n(&prod_head.raw, &oh.raw, nh.raw,
                                             true, __ATOMIC_ACQUIRE,
                                             __ATOMIC_ACQUIRE));
-
       for (uint32_t i = 0; i < l; ++i) {
         new (&ring[to_id(oh.pos + i)]) T(*(first++));
       }
-
-      if (flags & ConQueueMode::F_MP_HTS_ENQ) {
-        hts_update_ht(&prod_tail, l, oh.pos);
-      } else {
-        rts_update_ht(&prod_head, &prod_tail);
-      }
+      rts_update_ht(&prod_head, &prod_tail);
     }
     return l;
   }
-  bool pop(T *__x) {
+  bool pop(T *x) {
     if (flags & ConQueueMode::F_SC_DEQ) {
-      if (__glibc_unlikely(cons_head.pos == prod_tail.pos))
+      if (__glibc_unlikely(cons_tail.pos == prod_tail.pos))
         return false;
 
-      new (__x) T(std::move(ring[to_id(cons_head.pos)]));
-      ring[to_id(cons_head.pos)].~T();
+      new (x) T(std::move(ring[to_id(cons_tail.pos)]));
+      ring[to_id(cons_tail.pos)].~T();
 
-      ++cons_head.pos;
       ++cons_tail.pos;
+    } else if (flags & ConQueueMode::F_MC_HTS_DEQ) {
+      union po_val_t ot, nt;
+      ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
+      do {
+        if (__glibc_unlikely(ot.pos == prod_tail.pos))
+          return false;
+        nt.pos = ot.pos + 1;
+      } while (!__atomic_compare_exchange_n(&cons_head.raw, &ot.raw, nt.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+      new (x) T(std::move(ring[to_id(ot.pos)]));
+      ring[to_id(ot.pos)].~T();
+      hts_update_ht(&cons_tail, 1, ot.pos);
     } else {
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
@@ -204,20 +194,13 @@ public:
         if (__glibc_unlikely(ot.pos == prod_tail.pos))
           return false;
         nt.pos = ot.pos + 1;
-        if (flags & ConQueueMode::F_MC_RTS_DEQ)
-          nt.cnt = ot.cnt + 1;
+        nt.cnt = ot.cnt + 1;
       } while (!__atomic_compare_exchange_n(&cons_head.raw, &ot.raw, nt.raw,
                                             true, __ATOMIC_ACQUIRE,
                                             __ATOMIC_ACQUIRE));
-
-      new (__x) T(std::move(ring[to_id(ot.pos)]));
+      new (x) T(std::move(ring[to_id(ot.pos)]));
       ring[to_id(ot.pos)].~T();
-
-      if (flags & ConQueueMode::F_MC_HTS_DEQ) {
-        hts_update_ht(&cons_tail, 1, ot.pos);
-      } else {
-        rts_update_ht(&cons_head, &cons_tail);
-      }
+      rts_update_ht(&cons_head, &cons_tail);
     }
     return true;
   }
@@ -232,14 +215,29 @@ public:
     uint32_t l = 0;
     uint32_t count = std::distance(first, last);
     if (flags & ConQueueMode::F_SC_DEQ) {
-      while (count != 0 && cons_head.pos < prod_tail.pos) {
-        new (&*(first++)) T(std::move(ring[to_id(cons_head.pos + l)]));
-        ring[to_id(cons_head.pos + l)].~T();
+      while (count != 0 && cons_tail.pos < prod_tail.pos) {
+        new (&*(first++)) T(std::move(ring[to_id(cons_tail.pos + l)]));
+        ring[to_id(cons_tail.pos + l)].~T();
         --count;
         ++l;
       }
-      cons_head.pos += l;
       cons_tail.pos += l;
+    } else if (flags & ConQueueMode::F_MC_HTS_DEQ) {
+      union po_val_t ot, nt;
+      ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
+      do {
+        l = std::min(count, prod_tail.pos - ot.pos);
+        if (l == 0)
+          return 0;
+        nt.pos = ot.pos + l;
+      } while (!__atomic_compare_exchange_n(&cons_head.raw, &ot.raw, nt.raw,
+                                            true, __ATOMIC_ACQUIRE,
+                                            __ATOMIC_ACQUIRE));
+      for (uint32_t i = 0; i < l; ++i) {
+        new (&*(first++)) T(std::move(ring[to_id(ot.pos + i)]));
+        ring[to_id(ot.pos + i)].~T();
+      }
+      hts_update_ht(&cons_tail, l, ot.pos);
     } else {
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
@@ -248,22 +246,15 @@ public:
         if (l == 0)
           return 0;
         nt.pos = ot.pos + l;
-        if (flags & ConQueueMode::F_MC_RTS_DEQ)
-          nt.cnt = ot.cnt + 1;
+        nt.cnt = ot.cnt + 1;
       } while (!__atomic_compare_exchange_n(&cons_head.raw, &ot.raw, nt.raw,
                                             true, __ATOMIC_ACQUIRE,
                                             __ATOMIC_ACQUIRE));
-
       for (uint32_t i = 0; i < l; ++i) {
         new (&*(first++)) T(std::move(ring[to_id(ot.pos + i)]));
         ring[to_id(ot.pos + i)].~T();
       }
-
-      if (flags & ConQueueMode::F_MC_HTS_DEQ) {
-        hts_update_ht(&cons_tail, l, ot.pos);
-      } else {
-        rts_update_ht(&cons_head, &cons_tail);
-      }
+      rts_update_ht(&cons_head, &cons_tail);
     }
     return l;
   }
@@ -291,7 +282,7 @@ private:
   uint32_t count_mask;
   uint32_t max_size;
 
-  volatile po_val_t prod_head;
+  __attribute__((aligned(64))) volatile po_val_t prod_head;
   volatile po_val_t prod_tail;
   __attribute__((aligned(64))) volatile po_val_t cons_head;
   volatile po_val_t cons_tail;
@@ -345,9 +336,9 @@ private:
   }
 };
 
-template <typename T> class CmQueue {
+template <typename T> class CLQueue {
 public:
-  CmQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
+  CLQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
                                               ConQueueMode::F_MC_HTS_DEQ)
       : flags(flags) {
     if (max_size == 0)
@@ -376,7 +367,10 @@ public:
     cls = (cache_line_t *)aligned_alloc(64, max_line * sizeof(cache_line_t));
     clear();
   }
-  ~CmQueue() { free(cls); }
+  ~CLQueue() {
+    clear();
+    free(cls);
+  }
 
   uint32_t capacity() const { return max_size; }
   uint32_t size() const {
@@ -403,6 +397,12 @@ public:
     return cl->slots[si];
   }
   void clear() {
+    for (uint32_t i = tail; i != head; ++i) {
+      uint32_t li = i & max_line_mask;
+      cache_line_t *cl = &cls[i];
+      uint32_t si = (i >> max_line_mask_bits) % SLOT_MAX_INLINE;
+      cl->slots[si].~T();
+    }
     head = tail = 0;
     for (uint32_t li = 0; li < max_line; ++li) {
       cls[li].hf1 = cls[li].tf1 = 0;
@@ -410,20 +410,20 @@ public:
     }
     cls[0].hf1 = cls[0].tf1 = 1;
   }
-  bool push(T *x) {
+  bool push(const T &x) { return emplace(std::forward<const T &>(x)); }
+  bool push(T &&x) { return emplace(std::forward<T>(x)); }
+  template <typename... Args> bool emplace(Args &&...args) {
     uint32_t li, next_li, si;
     cache_line_t *cl;
     if (flags & F_SP_ENQ) {
-      uint32_t oh = head.fetch_add(1, std::memory_order_relaxed);
+      uint32_t oh = head.load(std::memory_order_relaxed);
       li = oh & max_line_mask;
       cl = &cls[li];
-      if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE &&
-                           head.load(std::memory_order_acquire) == oh)) {
-        head.fetch_sub(1, std::memory_order_relaxed);
+      if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE))
         return false;
-      }
+      head.fetch_add(1, std::memory_order_relaxed);
       si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
-      cl->slots[si] = x;
+      new (&cl->slots[si]) T(std::forward<Args>(args)...);
     } else {
       uint32_t oh = head.load(std::memory_order_acquire);
       do {
@@ -436,7 +436,7 @@ public:
           !head.compare_exchange_weak(oh, oh + 1, std::memory_order_acquire));
 
       si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
-      cl->slots[si] = x;
+      new (&cl->slots[si]) T(std::forward<Args>(args)...);
 
       if (flags & F_MP_HTS_ENQ) {
         int rep = 0;
@@ -455,20 +455,19 @@ public:
     ++cl->hf2;
     return true;
   }
-  bool pop(T **x) {
+  bool pop(T *x) {
     uint32_t li, next_li, si;
     cache_line_t *cl;
     if (flags & F_SC_DEQ) {
-      uint32_t ot = tail.fetch_add(1, std::memory_order_relaxed);
+      uint32_t ot = tail.load(std::memory_order_relaxed);
       li = ot & max_line_mask;
       cl = &cls[li];
-      if (__glibc_unlikely(cl->hf2 == cl->tf2 &&
-                           tail.load(std::memory_order_acquire) == ot)) {
-        tail.fetch_sub(1, std::memory_order_relaxed);
+      if (__glibc_unlikely(cl->hf2 == cl->tf2))
         return false;
-      }
+      tail.fetch_add(1, std::memory_order_relaxed);
       si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
-      *x = cl->slots[si];
+      new (x) T(std::move(cl->slots[si]));
+      cl->slots[si].~T();
     } else {
       uint32_t ot = tail.load(std::memory_order_acquire);
       do {
@@ -481,7 +480,8 @@ public:
           !tail.compare_exchange_weak(ot, ot + 1, std::memory_order_acquire));
 
       si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
-      *x = cl->slots[si];
+      new (x) T(std::move(cl->slots[si]));
+      cl->slots[si].~T();
 
       if (flags & F_MC_HTS_DEQ) {
         int rep = 0;
@@ -502,12 +502,25 @@ public:
   }
 
 private:
-  static const int REP_COUNT = 3;
-  static const int SLOT_MAX_INLINE = 7;
+  static constexpr size_t T_SIZE = sizeof(T);
+  static constexpr size_t CACHE_LINE_SIZE = 64;
 
+  static_assert(T_SIZE == 1 || T_SIZE == 2 || T_SIZE == 4 || T_SIZE == 8,
+                "CLQueue type size must be 1, 2, 4 or 8.");
+
+  static const int SLOT_MAX_INLINE = (CACHE_LINE_SIZE - 8) / T_SIZE;
+  static const int REP_COUNT = 3;
+
+  /*    cache line size
+   * [ f  |    slots    ]
+   * [ f  |    slots    ]
+   * [ f  |    slots    ]
+   *
+   * push/pop order: Stroke order of 'W'
+   */
   struct cache_line_t {
     volatile uint16_t hf1, hf2, tf1, tf2;
-    T *slots[SLOT_MAX_INLINE];
+    T slots[SLOT_MAX_INLINE];
   };
 
   uint32_t flags;
@@ -517,14 +530,35 @@ private:
   uint32_t max_line_mask;
   uint8_t max_line_mask_bits;
 
-  std::atomic<uint32_t> head;
+  __attribute__((aligned(64))) std::atomic<uint32_t> head;
   __attribute__((aligned(64))) std::atomic<uint32_t> tail;
 };
 
 #include "extend_mutex.h"
 
-template <typename T> struct MpScNoRestrictBoundedQueue {
-  MpScNoRestrictBoundedQueue(uint32_t init_size = 65536) : cons(0) {
+template <typename T> class MpScNoRestrictBoundedQueue {
+public:
+  MpScNoRestrictBoundedQueue(uint32_t init_size = 65536,
+                             uint32_t flags = ConQueueMode::F_MP_RTS_ENQ |
+                                              ConQueueMode::F_SC_DEQ)
+      : cons(0), flags(flags) {
+    if (init_size == 0)
+      throw "init size is 0";
+    if (this->flags & F_MP_HTS_ENQ)
+      throw "queue producer flag error";
+    if ((this->flags & F_SP_ENQ) && (this->flags & F_MP_RTS_ENQ))
+      throw "queue producer flag error";
+    if (this->flags & (F_MC_RTS_DEQ | F_MC_HTS_DEQ))
+      throw "queue consumer flag error";
+    if (this->flags & F_EXACT_SZ)
+      throw "queue exact size flag error";
+
+    // default flag set
+    if (!(this->flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
+      this->flags |= F_MP_HTS_ENQ;
+    if (!(this->flags & F_SC_DEQ))
+      this->flags |= F_MC_HTS_DEQ;
+
     if (check_little_endian()) {
       w_.li.max_size = init_size;
       w_.li.arr = new T[init_size];
@@ -564,53 +598,44 @@ template <typename T> struct MpScNoRestrictBoundedQueue {
   // No sequentially consistency, i.e. the elements of the push may not be
   // visible when the thread is popped. This is a better solution for
   // high performance.
-  bool push(const T &x) {
+  bool push(const T &x) { return emplace(std::forward<const T &>(x)); }
+  bool push(T &&x) { return emplace(std::forward<T>(x)); }
+  template <typename... Args> bool emplace(Args &&...args) {
     po_val_t oh;
-    oh.raw =
-        __atomic_fetch_add(&prod_head.raw, (1ul << 32) | 1ul, __ATOMIC_ACQUIRE);
-    uint32_t i = oh.pos;
+    if (flags & ConQueueMode::F_SP_ENQ) {
+      uint32_t i = prod_head.pos;
+      if (__glibc_unlikely(i - cons >= get_max_size()))
+        expand_arr(i);
 
-    expand_lck_.lock_shared();
+      auto p = get_word_pair();
+      new (&p.first[i & (p.second - 1)]) T(std::forward<Args>(args)...);
+      ++prod_head.pos;
+      ++prod_tail.pos;
+    } else {
+      oh.raw = __atomic_fetch_add(&prod_head.raw, (1ul << 32) | 1ul,
+                                  __ATOMIC_ACQUIRE);
+      uint32_t i = oh.pos;
 
-  retry:
-    if (__glibc_unlikely(i - cons >= get_max_size())) {
-      if (!expand_lck_.try_lock_prompt()) {
-        expand_lck_.unlock_shared();
-        uint64_t o = get_max_size();
-        while (i - cons >= get_max_size() && o == get_max_size()) {
-          std::this_thread::yield();
+    retry:
+      expand_lck_.lock_shared();
+      if (__glibc_unlikely(i - cons >= get_max_size())) {
+        if (!expand_lck_.try_lock_prompt()) {
+          expand_lck_.unlock_shared();
+          goto retry;
         }
-        expand_lck_.lock_shared();
+        if (i - cons >= get_max_size())
+          expand_arr(i);
+        expand_lck_.unlock();
         goto retry;
       }
-      if (i - cons >= get_max_size()) {
-        auto p = get_word_pair();
-        uint32_t old_size = p.second;
-        T *old_arr = p.first;
 
-        uint32_t new_size = get_max_size() << 1;
-        T *new_arr = new T[new_size];
+      auto p = get_word_pair();
+      new (&p.first[i & (p.second - 1)]) T(std::forward<Args>(args)...);
 
-        // The other threads with `oh.pos >= i` are not assigning element to the
-        // queue at this time. And other threads with `oh.pos < i` have assigned
-        // element to the queue.
-
-        for (uint32_t j = i - 1; j != cons - 1; --j) {
-          new_arr[j % new_size] = old_arr[j % old_size];
-        }
-        update_arr_and_size(new_arr, new_size);
-        delete[] old_arr;
-      }
-      expand_lck_.unlock();
-
-      goto retry;
+      // use rts mode to remove dead lock
+      rts_update_ht(&prod_head, &prod_tail);
+      expand_lck_.unlock_shared();
     }
-
-    new (&get_arr()[i % get_max_size()]) T(x);
-
-    // use rts mode to remove dead lock
-    rts_update_ht(&prod_head, &prod_tail);
-    expand_lck_.unlock_shared();
 
     return true;
   }
@@ -620,11 +645,12 @@ template <typename T> struct MpScNoRestrictBoundedQueue {
   bool pop(T *x) {
     // need thread-fence, otherwise `arr` and `max_size` is inconsistent.
     auto p = get_word_pair();
-    *x = std::move(p.first[cons % p.second]);
+    *x = std::move(p.first[cons & (p.second - 1)]);
     ++cons;
     return true;
   }
 
+private:
   union po_val_t {
     struct {
       uint32_t pos;
@@ -669,12 +695,31 @@ template <typename T> struct MpScNoRestrictBoundedQueue {
   }
 
   // load `arr` and `max_size` together
-  std::pair<T *, uint32_t> get_word_pair() const volatile {
+  std::pair<T *, uint32_t> get_word_pair() const {
     if (check_little_endian()) {
       return {w_.li.arr, w_.li.max_size};
     } else {
       return {w_.bi.arr, w_.bi.max_size};
     }
+  }
+
+  void expand_arr(uint32_t current_i) {
+    auto p = get_word_pair();
+    uint32_t old_size = p.second;
+    T *old_arr = p.first;
+
+    uint32_t new_size = get_max_size() << 1;
+    T *new_arr = new T[new_size];
+
+    // The other threads with `oh.pos >= i` are not assigning element to the
+    // queue at this time. And other threads with `oh.pos < i` have assigned
+    // element to the queue.
+
+    for (uint32_t j = current_i - 1; j != cons - 1; --j) {
+      new_arr[j % new_size] = old_arr[j % old_size];
+    }
+    update_arr_and_size(new_arr, new_size);
+    delete[] old_arr;
   }
 
   // In order to achieve atomic update of `arr` pointer and `max_size`,
@@ -727,7 +772,8 @@ template <typename T> struct MpScNoRestrictBoundedQueue {
     }
   }
 
-  word w_;
+  uint32_t flags;
+  __attribute__((aligned(64))) volatile word w_;
   intention_mutex expand_lck_;
   volatile po_val_t prod_head, prod_tail;
   __attribute__((aligned(64))) volatile uint32_t cons;
