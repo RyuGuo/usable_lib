@@ -11,8 +11,6 @@
 #include <atomic>
 #include <cstdlib>
 #include <emmintrin.h>
-#include <iterator>
-#include <sys/cdefs.h>
 #include <thread>
 
 enum ConQueueMode {
@@ -131,7 +129,7 @@ public:
         new (&ring[to_id(prod_tail.pos + i)]) T(*(first++));
       }
       prod_tail.pos += l;
-    } else if (flags & ConQueueMode::F_MP_RTS_ENQ) {
+    } else if (flags & ConQueueMode::F_MP_HTS_ENQ) {
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
       do {
@@ -410,13 +408,27 @@ public:
     }
     cls[0].hf1 = cls[0].tf1 = 1;
   }
-  bool push(const T &x) { return emplace(std::forward<const T &>(x)); }
-  bool push(T &&x) { return emplace(std::forward<T>(x)); }
+  bool push(const T &x) {
+    return emplace_impl<false>(std::forward<const T &>(x));
+  }
+  bool push(T &&x) { return emplace_impl<false>(std::forward<T>(x)); }
+  /**
+   * @warning If false is returned, the thread will occupy a slot in the queue,
+   * and you must re-calling the function until it returns success, inserting
+   * the element so that the slot is actually used.
+   */
+  bool push_with_delay(const T &x) {
+    return emplace_impl<true>(std::forward<const T &>(x));
+  }
+  bool push_with_delay(T &&x) { return emplace_impl<true>(std::forward<T>(x)); }
   template <typename... Args> bool emplace(Args &&...args) {
-    uint32_t li, next_li, si;
+    return emplace_impl<false>(std::forward<Args>(args)...);
+  }
+  template <bool TF, typename... Args> bool emplace_impl(Args &&...args) {
+    uint32_t oh, li, next_li, si;
     cache_line_t *cl;
     if (flags & F_SP_ENQ) {
-      uint32_t oh = head.load(std::memory_order_relaxed);
+      oh = head.load(std::memory_order_relaxed);
       li = oh & max_line_mask;
       cl = &cls[li];
       if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE))
@@ -425,15 +437,30 @@ public:
       si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
       new (&cl->slots[si]) T(std::forward<Args>(args)...);
     } else {
-      uint32_t oh = head.load(std::memory_order_acquire);
-      do {
+      if (TF) {
+        static thread_local uint32_t push_slot_token = -1u;
+        if (__glibc_likely(push_slot_token == -1u)) {
+          oh = head.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          oh = push_slot_token;
+        }
         li = oh & max_line_mask;
         cl = &cls[li];
-        if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE &&
-                             head.load(std::memory_order_acquire) == oh))
+        if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE)) {
+          push_slot_token = oh;
           return false;
-      } while (
-          !head.compare_exchange_weak(oh, oh + 1, std::memory_order_acquire));
+        }
+        push_slot_token = -1u;
+      } else {
+        oh = head.load(std::memory_order_acquire);
+        do {
+          li = oh & max_line_mask;
+          cl = &cls[li];
+          if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE))
+            return false;
+        } while (
+            !head.compare_exchange_weak(oh, oh + 1, std::memory_order_acquire));
+      }
 
       si = (oh >> max_line_mask_bits) % SLOT_MAX_INLINE;
       new (&cl->slots[si]) T(std::forward<Args>(args)...);
@@ -455,11 +482,12 @@ public:
     ++cl->hf2;
     return true;
   }
+
   bool pop(T *x) {
-    uint32_t li, next_li, si;
+    uint32_t ot, li, next_li, si;
     cache_line_t *cl;
     if (flags & F_SC_DEQ) {
-      uint32_t ot = tail.load(std::memory_order_relaxed);
+      ot = tail.load(std::memory_order_relaxed);
       li = ot & max_line_mask;
       cl = &cls[li];
       if (__glibc_unlikely(cl->hf2 == cl->tf2))
@@ -469,17 +497,37 @@ public:
       new (x) T(std::move(cl->slots[si]));
       cl->slots[si].~T();
     } else {
-      uint32_t ot = tail.load(std::memory_order_acquire);
-      do {
+      /**
+       * Needed to determine if the queue is empty before the queue pop element.
+       *
+       * `dequeue_overcommit` indicates the number of queues currently being
+       * popped. `overcommit` indicates the number of failed queue pops.
+       *
+       * The distance between `dequeue_overcommit` and `overcommit` represents
+       * the position of the slot that needs to be inserted by the threads
+       * currently being popped. If the value is less than `head`, it means that
+       * the queue has not yet inserted an element here, the function returns
+       * false and add `overcommit` value so that the slot position is moved
+       * forward on the next pop call.
+       */
+      uint32_t doc = dequeue_overcommit.fetch_add(1, std::memory_order_relaxed);
+      if (__glibc_likely(doc - overcommit.load(std::memory_order_relaxed) <
+                         head.load(std::memory_order_relaxed))) {
+        ot = tail.fetch_add(1, std::memory_order_relaxed);
         li = ot & max_line_mask;
         cl = &cls[li];
-        if (__glibc_unlikely(cl->hf2 == cl->tf2 &&
-                             tail.load(std::memory_order_acquire) == ot))
-          return false;
-      } while (
-          !tail.compare_exchange_weak(ot, ot + 1, std::memory_order_acquire));
+        si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
+        /**
+         * Running here means that the slot has been occupied by the push
+         * thread, so we need to wait for it to insert the element.
+         */
+        while (__glibc_unlikely(cl->hf2 == cl->tf2)) {
+        }
+      } else {
+        overcommit.fetch_add(1, std::memory_order_release);
+        return false;
+      }
 
-      si = (ot >> max_line_mask_bits) % SLOT_MAX_INLINE;
       new (x) T(std::move(cl->slots[si]));
       cl->slots[si].~T();
 
@@ -519,7 +567,7 @@ private:
    * push/pop order: Stroke order of 'W'
    */
   struct cache_line_t {
-    volatile uint16_t hf1, hf2, tf1, tf2;
+    volatile uint16_t hf1, tf1, hf2, tf2;
     T slots[SLOT_MAX_INLINE];
   };
 
@@ -530,6 +578,8 @@ private:
   uint32_t max_line_mask;
   uint8_t max_line_mask_bits;
 
+  __attribute__((aligned(64))) std::atomic<uint32_t> dequeue_overcommit = {0};
+  std::atomic<uint32_t> overcommit = {0};
   __attribute__((aligned(64))) std::atomic<uint32_t> head;
   __attribute__((aligned(64))) std::atomic<uint32_t> tail;
 };
