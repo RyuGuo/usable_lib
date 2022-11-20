@@ -16,7 +16,7 @@ constexpr uint32_t upper_power_of_2(uint32_t n) {
   return n + 1;
 }
 
-const uint32_t IT = 1000000;
+const uint32_t IT = 500000;
 int prod_th_num, cons_th_num;
 int _ts_ = 0; // 0: hts, 1: rts
 
@@ -101,7 +101,7 @@ struct CLQ : public TestQueueModelBase<uint32_t>, CLQueue<uint32_t> {
   CLQ() : CLQueue<uint32_t>(upper_power_of_2(IT), conq_flag_get()) {}
   virtual ~CLQ() override {}
   virtual void enqueue(uint32_t x) override {
-    CLQueue<uint32_t>::push_with_delay(x);
+    CLQueue<uint32_t>::push_unsafe(x);
   }
   virtual bool dequeue(uint32_t &x) override {
     return CLQueue<uint32_t>::pop(&x);
@@ -173,10 +173,10 @@ struct ModcQ : public TestQueueModelBase<uint32_t>,
 int main() {
   std::vector<int> v = {1, 2, 4, 5, 8, 10, 16, 20};
 
+  _ts_ = 0;
   for (int c = 0; c < v.size(); ++c) {
     for (int p = 0; p < v.size(); ++p) {
       {
-        _ts_ = 0;
         prod_th_num = v[p];
         cons_th_num = v[c];
         {
@@ -217,6 +217,7 @@ int main() {
           mpscq_bench.run_test_task(0, nullptr);
         }
       }
+      printf("===================================\n");
     }
   }
 

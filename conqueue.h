@@ -413,14 +413,15 @@ public:
   }
   bool push(T &&x) { return emplace_impl<false>(std::forward<T>(x)); }
   /**
-   * @warning If false is returned, the thread will occupy a slot in the queue,
-   * and you must re-calling the function until it returns success, inserting
-   * the element so that the slot is actually used.
+   * Push an element for better performance without checking queue is full.
+   * @warning If queue is full, the thread will occupy a slot as usual, which
+   * may causes pop operation stall. So in this case, the call will throw an
+   * error.
    */
-  bool push_with_delay(const T &x) {
+  bool push_unsafe(const T &x) {
     return emplace_impl<true>(std::forward<const T &>(x));
   }
-  bool push_with_delay(T &&x) { return emplace_impl<true>(std::forward<T>(x)); }
+  bool push_unsafe(T &&x) { return emplace_impl<true>(std::forward<T>(x)); }
   template <typename... Args> bool emplace(Args &&...args) {
     return emplace_impl<false>(std::forward<Args>(args)...);
   }
@@ -438,19 +439,11 @@ public:
       new (&cl->slots[si]) T(std::forward<Args>(args)...);
     } else {
       if (TF) {
-        static thread_local uint32_t push_slot_token = -1u;
-        if (__glibc_likely(push_slot_token == -1u)) {
-          oh = head.fetch_add(1, std::memory_order_relaxed);
-        } else {
-          oh = push_slot_token;
-        }
+        oh = head.fetch_add(1, std::memory_order_relaxed);
         li = oh & max_line_mask;
         cl = &cls[li];
-        if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE)) {
-          push_slot_token = oh;
-          return false;
-        }
-        push_slot_token = -1u;
+        if (__glibc_unlikely(cl->hf2 - cl->tf2 == SLOT_MAX_INLINE))
+          throw "queue full";
       } else {
         oh = head.load(std::memory_order_acquire);
         do {
@@ -505,14 +498,16 @@ public:
        *
        * The distance between `dequeue_overcommit` and `overcommit` represents
        * the position of the slot that needs to be inserted by the threads
-       * currently being popped. If the value is less than `head`, it means that
-       * the queue has not yet inserted an element here, the function returns
-       * false and add `overcommit` value so that the slot position is moved
-       * forward on the next pop call.
+       * currently being popped. If the `hf2` and `tf2` of the slot are not
+       * equal, it means that the queue has not yet inserted an element here,
+       * the function returns false and add `overcommit` value so that the slot
+       * position is moved forward on the next pop call.
        */
       uint32_t doc = dequeue_overcommit.fetch_add(1, std::memory_order_relaxed);
-      if (__glibc_likely(doc - overcommit.load(std::memory_order_relaxed) <
-                         head.load(std::memory_order_relaxed))) {
+      ot = doc - overcommit.load(std::memory_order_relaxed);
+      li = ot & max_line_mask;
+      cl = &cls[li];
+      if (__glibc_likely(cl->hf2 != cl->tf2)) {
         ot = tail.fetch_add(1, std::memory_order_relaxed);
         li = ot & max_line_mask;
         cl = &cls[li];
@@ -521,7 +516,13 @@ public:
          * Running here means that the slot has been occupied by the push
          * thread, so we need to wait for it to insert the element.
          */
+        int rep = 0;
         while (__glibc_unlikely(cl->hf2 == cl->tf2)) {
+          _mm_pause();
+          if (++rep == REP_COUNT) {
+            rep = 0;
+            std::this_thread::yield();
+          }
         }
       } else {
         overcommit.fetch_add(1, std::memory_order_release);
@@ -552,12 +553,14 @@ public:
 private:
   static constexpr size_t T_SIZE = sizeof(T);
   static constexpr size_t CACHE_LINE_SIZE = 64;
+  static constexpr int T_INLINE_MIN = 7;
 
-  static_assert(T_SIZE == 1 || T_SIZE == 2 || T_SIZE == 4 || T_SIZE == 8,
-                "CLQueue type size must be 1, 2, 4 or 8.");
-
-  static const int SLOT_MAX_INLINE = (CACHE_LINE_SIZE - 8) / T_SIZE;
-  static const int REP_COUNT = 3;
+  static constexpr size_t LINE_SIZE =
+      ((T_INLINE_MIN * T_SIZE + 8) & 0x3f)
+          ? (((T_INLINE_MIN * T_SIZE + 8) & ~(0x3f)) + CACHE_LINE_SIZE)
+          : (T_INLINE_MIN * T_SIZE + 8);
+  static constexpr int SLOT_MAX_INLINE = (LINE_SIZE - 8) / T_SIZE;
+  static constexpr int REP_COUNT = 3;
 
   /*    cache line size
    * [ f  |    slots    ]
@@ -569,7 +572,7 @@ private:
   struct cache_line_t {
     volatile uint16_t hf1, tf1, hf2, tf2;
     T slots[SLOT_MAX_INLINE];
-  };
+  } __attribute__((aligned(CACHE_LINE_SIZE)));
 
   uint32_t flags;
   cache_line_t *cls;
