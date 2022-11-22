@@ -63,13 +63,15 @@ public:
   void wait() { pthread_barrier_wait(&b); }
 };
 
-class spin_mutex_b64 {
+template <typename D> class __spin_mutex_impl {
 public:
-  spin_mutex_b64() : l(0) {}
+  static constexpr size_t size = sizeof(D);
+
+  __spin_mutex_impl() : l(0) {}
 
   void lock(uint8_t i) {
     while (1) {
-      uint64_t _l = l.fetch_or(1UL << i, std::memory_order_acquire);
+      D _l = l.fetch_or(1UL << i, std::memory_order_acquire);
       if ((_l & (1UL << i)) == 0)
         break;
       std::this_thread::yield();
@@ -77,7 +79,7 @@ public:
   }
   void lock() { lock(0); }
   bool try_lock(uint8_t i) {
-    uint64_t _l = l.fetch_or(1UL << i, std::memory_order_acquire);
+    D _l = l.fetch_or(1UL << i, std::memory_order_acquire);
     return (_l & (1UL << i)) == 0;
   }
   bool try_lock() { return try_lock(0); }
@@ -85,33 +87,13 @@ public:
   void unlock() { unlock(0); }
 
 private:
-  std::atomic<uint64_t> l;
+  std::atomic<D> l;
 };
 
-class spin_mutex_b8 {
-public:
-  spin_mutex_b8() : l(0) {}
-
-  void lock(uint8_t i) {
-    while (1) {
-      uint8_t _l = l.fetch_or(1U << i, std::memory_order_acquire);
-      if ((_l & (1 << i)) == 0)
-        break;
-      std::this_thread::yield();
-    }
-  }
-  void lock() { lock(0); }
-  bool try_lock(uint8_t i) {
-    uint8_t _l = l.fetch_or(1U << i, std::memory_order_acquire);
-    return (_l & (1U << i)) == 0;
-  }
-  bool try_lock() { return try_lock(0); }
-  void unlock(uint8_t i) { l.fetch_xor(1U << i, std::memory_order_release); }
-  void unlock() { unlock(0); }
-
-private:
-  std::atomic<uint8_t> l;
-};
+using spin_mutex_b8 = __spin_mutex_impl<uint8_t>;
+using spin_mutex_b16 = __spin_mutex_impl<uint16_t>;
+using spin_mutex_b32 = __spin_mutex_impl<uint32_t>;
+using spin_mutex_b64 = __spin_mutex_impl<uint64_t>;
 
 class ticket_mutex {
 public:
@@ -136,30 +118,32 @@ private:
   std::atomic<uint32_t> l;
 };
 
-class shared_mutex_u8 {
+template <typename D> class __shared_mutex_impl {
 public:
-  shared_mutex_u8() : l(0) {}
+  static constexpr size_t size = sizeof(D);
+
+  __shared_mutex_impl() : l(0) {}
 
   void lock() {
-    uint8_t _l = 0;
+    D _l = 0;
     while (!l.compare_exchange_weak(_l, 1, std::memory_order_acquire)) {
       _l = 0;
       std::this_thread::yield();
     }
   }
   void lock_shared() {
-    uint8_t _l = l.fetch_add(2, std::memory_order_acquire);
+    D _l = l.fetch_add(2, std::memory_order_acquire);
     while (_l & 1) {
       std::this_thread::yield();
       _l = l.load(std::memory_order_relaxed);
     }
   }
   bool try_lock() {
-    uint8_t _l = 0;
+    D _l = 0;
     return l.compare_exchange_weak(_l, 1, std::memory_order_acquire);
   }
   bool try_lock_shared() {
-    uint8_t _l = l.fetch_add(2, std::memory_order_acquire);
+    D _l = l.fetch_add(2, std::memory_order_acquire);
     if (_l & 1) {
       l.fetch_sub(2, std::memory_order_release);
       return false;
@@ -170,8 +154,13 @@ public:
   void unlock_shared() { l.fetch_sub(2, std::memory_order_release); }
 
 private:
-  std::atomic<uint8_t> l;
+  std::atomic<D> l;
 };
+
+using shared_mutex_b8 = __shared_mutex_impl<uint8_t>;
+using shared_mutex_b16 = __shared_mutex_impl<uint16_t>;
+using shared_mutex_b32 = __shared_mutex_impl<uint32_t>;
+using shared_mutex_b64 = __shared_mutex_impl<uint64_t>;
 
 struct intention_mutex {
   intention_mutex() : l(0) {}

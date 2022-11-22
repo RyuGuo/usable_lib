@@ -2,4 +2,6 @@
 test.cc
 *.o
 *.out
+*.log
+*.csv
 queue-bench/bench
