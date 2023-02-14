@@ -142,7 +142,7 @@ public:
         bitword[e] = 0;
       else
         __atomic_fetch_and(&bitword[e], ~((1UL << t) - 1UL),
-                           __ATOMIC_SEQ_CST);
+                           __ATOMIC_RELAXED);
     }
   }
 };

@@ -11,7 +11,6 @@ struct SegAllocator {
   std::set<std::pair<size_t, uint64_t>> free_seg_set_siz;
   std::map<uint64_t, size_t> free_seg_set_off;
   uint64_t base;
-  size_t size;
 
   void init(uint64_t base, size_t size) {
     free_seg_set_siz.clear();
@@ -76,17 +75,19 @@ struct SegAllocator {
   }
   void deallocate(uint64_t off, size_t size) {
     std::unique_lock<std::mutex> lck(lock);
-    auto next = free_seg_set_off.lower_bound(off);
+    auto next = free_seg_set_off.lower_bound(off), iter = next;
     int flag = 0;
     // check if merge next seg
     if (next != free_seg_set_off.end() && off + size == next->first) {
       flag |= 1;
     }
 
-    auto iter = next--; // prev
-    // check if merge prev seg
-    if (next != free_seg_set_off.end() && next->first + next->second == off) {
-      flag |= 2;
+    if (next != free_seg_set_off.begin()) {
+      --next; // prev
+      // check if merge prev seg
+      if (next != free_seg_set_off.end() && next->first + next->second == off) {
+        flag |= 2;
+      }
     }
 
     switch (flag) {
@@ -118,6 +119,8 @@ struct SegAllocator {
   }
 };
 struct SegAllocatorGreater : public SegAllocator {
+  size_t size;
+
   void init(uint64_t base, size_t size) {
     this->base = base;
     this->size = size;
