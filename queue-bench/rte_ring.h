@@ -176,8 +176,6 @@ private:
       }
 
       prod_next = prod_head + n;
-      // printf("prod.prod_head_: %u prod_head: %u, prod_next: %u\n",
-      //         prod.prod_head_, prod_head, prod_next);
       if (__atomic_compare_exchange_n(&prod.prod_head_, &prod_head, prod_next,
                                       false, __ATOMIC_ACQ_REL,
                                       __ATOMIC_RELAXED)) {
@@ -239,8 +237,6 @@ private:
       }
 
       cons_next = cons_head + 1;
-      // printf("cons.cons_head_: %u cons_head: %u, cons_next: %u\n",
-      //         cons.cons_head_, cons_head, cons_next);
       if (__atomic_compare_exchange_n(&cons.cons_head_, &cons_head, cons_next,
                                       false, __ATOMIC_ACQ_REL,
                                       __ATOMIC_RELAXED)) {
@@ -313,8 +309,6 @@ private:
       }
 
       cons_next = cons_head + n;
-      // printf("cons.cons_head_: %u cons_head: %u, cons_next: %u\n",
-      //         cons.cons_head_, cons_head, cons_next);
       if (__atomic_compare_exchange_n(&cons.cons_head_, &cons_head, cons_next,
                                       false, __ATOMIC_ACQ_REL,
                                       __ATOMIC_RELAXED)) {

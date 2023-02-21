@@ -161,13 +161,13 @@ struct ModcQ : public TestQueueModelBase<uint32_t>,
 int main() {
   std::vector<int> v = {1, 2, 4, 5, 8, 10, 16, 20};
   CSVFileStream *csv_p;
-  _ts_ = 1;
+  _ts_ = 0;
 
   for (int c = 0; c < v.size(); ++c) {
     cons_th_num = v[c];
     if (_ts_ == 0) {
       csv_p = new CSVFileStream("out_c_" + to_string(cons_th_num) + ".csv",
-                                {"prod", "rte_ring", "cl-queue"});
+                                {"prod", "rte_ring", "clqueue"});
     } else {
       csv_p = new CSVFileStream(
           "out_c_" + to_string(cons_th_num) + ".csv",
@@ -188,12 +188,12 @@ int main() {
           rte_ring_throughput = rteq_bench.result_throughput;
         } else if (cons_th_num > 1 && prod_th_num == 1) {
           queue_bench<RteQ<RteRingMode::MC>> rteq_bench;
-          rteq_bench.test_name = "RteRing MC";
+          rteq_bench.test_name = "RteRing SPMC";
           rteq_bench.run_test_task(0, nullptr);
           rte_ring_throughput = rteq_bench.result_throughput;
         } else if (cons_th_num == 1 && prod_th_num > 1) {
           queue_bench<RteQ<RteRingMode::MP>> rteq_bench;
-          rteq_bench.test_name = "RteRing MP";
+          rteq_bench.test_name = "RteRing MPSC";
           rteq_bench.run_test_task(0, nullptr);
           rte_ring_throughput = rteq_bench.result_throughput;
         } else {
