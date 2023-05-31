@@ -10,7 +10,6 @@
 #ifndef __EXTEND_MUTEX_H__
 #define __EXTEND_MUTEX_H__
 
-#include "extend_new.h"
 #include <atomic>
 #include <pthread.h>
 #include <thread>
@@ -43,14 +42,6 @@ public:
   void unlock() { pthread_spin_unlock(&spinlock); }
 };
 
-class spin_condition_variable {
-public:
-  template <typename _Predicate> void wait(_Predicate __p) {
-    while (!__p())
-      std::this_thread::yield();
-  }
-};
-
 class barrier_t {
   pthread_barrier_t b;
 
@@ -59,34 +50,37 @@ public:
   barrier_t(unsigned int count) { pthread_barrier_init(&b, nullptr, count); }
   ~barrier_t() { pthread_barrier_destroy(&b); }
 
-  void init(unsigned int count) { pthread_barrier_init(&b, nullptr, count); }
   void wait() { pthread_barrier_wait(&b); }
 };
 
 template <typename D> class __spin_mutex_impl {
 public:
-  static constexpr size_t size = sizeof(D);
-
   __spin_mutex_impl() : l(0) {}
 
   void lock(uint8_t i) {
-    while (1) {
-      D _l = l.fetch_or(1UL << i, std::memory_order_acquire);
-      if ((_l & (1UL << i)) == 0)
-        break;
+    while (!try_lock(i)) {
       std::this_thread::yield();
     }
   }
+
   void lock() { lock(0); }
+
   bool try_lock(uint8_t i) {
-    D _l = l.fetch_or(1UL << i, std::memory_order_acquire);
-    return (_l & (1UL << i)) == 0;
+    if (check_lock(l.load(std::memory_order_relaxed), i))
+      return false;
+    D l_ = l.fetch_or(1UL << i, std::memory_order_acquire);
+    return !check_lock(l_, i);
   }
+
   bool try_lock() { return try_lock(0); }
+
   void unlock(uint8_t i) { l.fetch_xor(1UL << i, std::memory_order_release); }
+
   void unlock() { unlock(0); }
 
 private:
+  static bool check_lock(D l_, uint8_t i) { return (l_ & (1UL << i)) != 0; }
+
   std::atomic<D> l;
 };
 
@@ -98,26 +92,48 @@ using spin_mutex_b64 = __spin_mutex_impl<uint64_t>;
 class ticket_mutex {
 public:
   void lock() {
-    uint32_t ct = l.fetch_add(1u << 16, std::memory_order_acquire);
-    uint16_t t = ct >> 16;
-    while (t != (ct & 0xffff)) {
+    uint16_t ct = v.h.fetch_add(1, std::memory_order_acquire);
+    while (v.l.load(std::memory_order_acquire) != ct) {
       std::this_thread::yield();
-      ct = l.load(std::memory_order_acquire);
     }
   }
+
   bool try_lock() {
-    uint32_t ct = l.load(std::memory_order_acquire);
-    return (ct >> 16) == (ct & 0xffff) &&
-           l.compare_exchange_weak(ct, ct + (1u << 16),
-                                   std::memory_order_acquire);
+    raw_val_t ov, nv;
+    ov.raw = v.raw.load(std::memory_order_relaxed);
+    if (ov.h != ov.l)
+      return false;
+    nv = ov;
+    ++nv.h;
+    return v.raw.compare_exchange_weak(ov.raw, nv.raw,
+                                       std::memory_order_acquire);
   }
-  void unlock() { l.fetch_add(1, std::memory_order_release); }
+
+  void unlock() { v.l.fetch_add(1, std::memory_order_release); }
 
 private:
-  // h16: ticket, l16: cur_tick
-  std::atomic<uint32_t> l;
+  union atomic_val_t {
+    struct {
+      std::atomic<uint16_t> h;
+      std::atomic<uint16_t> l;
+    };
+    std::atomic<uint32_t> raw;
+
+    atomic_val_t() : raw(0) {}
+  };
+
+  union raw_val_t {
+    struct {
+      uint16_t h;
+      uint16_t l;
+    };
+    uint32_t raw;
+  };
+
+  atomic_val_t v;
 };
 
+// high read priority
 template <typename D> class __shared_mutex_impl {
 public:
   static constexpr size_t size = sizeof(D);
@@ -125,32 +141,35 @@ public:
   __shared_mutex_impl() : l(0) {}
 
   void lock() {
-    D _l = 0;
-    while (!l.compare_exchange_weak(_l, 1, std::memory_order_acquire)) {
-      _l = 0;
+    while (!try_lock()) {
       std::this_thread::yield();
     }
   }
+
   void lock_shared() {
-    D _l = l.fetch_add(2, std::memory_order_acquire);
-    while (_l & 1) {
+    D l_ = l.fetch_add(2, std::memory_order_acquire);
+    while (l_ & 1) {
       std::this_thread::yield();
-      _l = l.load(std::memory_order_relaxed);
+      l_ = l.load(std::memory_order_acquire);
     }
   }
+
   bool try_lock() {
-    D _l = 0;
-    return l.compare_exchange_weak(_l, 1, std::memory_order_acquire);
+    D l_ = 0;
+    return l.compare_exchange_weak(l_, 1, std::memory_order_acquire);
   }
+
   bool try_lock_shared() {
-    D _l = l.fetch_add(2, std::memory_order_acquire);
-    if (_l & 1) {
+    D l_ = l.fetch_add(2, std::memory_order_acquire);
+    if (l_ & 1) {
       l.fetch_sub(2, std::memory_order_release);
       return false;
     }
     return true;
   }
+
   void unlock() { l.fetch_xor(1, std::memory_order_release); }
+
   void unlock_shared() { l.fetch_sub(2, std::memory_order_release); }
 
 private:
@@ -162,97 +181,44 @@ using shared_mutex_b16 = __shared_mutex_impl<uint16_t>;
 using shared_mutex_b32 = __shared_mutex_impl<uint32_t>;
 using shared_mutex_b64 = __shared_mutex_impl<uint64_t>;
 
-struct intention_mutex {
-  intention_mutex() : l(0) {}
+template <typename D> struct __intention_mutex_impl {
+  __intention_mutex_impl() : l(0) {}
 
   void lock_shared() {
-    uint8_t o = l.load(std::memory_order_acquire);
+    D l_ = l.load(std::memory_order_acquire);
     while (1) {
-      if (o & 1) {
+      if (l_ & 1) {
         std::this_thread::yield();
-        o = l.load(std::memory_order_acquire);
-      } else if (l.compare_exchange_weak(o, o + 2, std::memory_order_acquire)) {
+        l_ = l.load(std::memory_order_acquire);
+      } else if (l.compare_exchange_weak(l_, l_ + 2,
+                                         std::memory_order_acquire)) {
         break;
       }
     }
   }
 
   bool try_lock_prompt() {
-    uint8_t o = l.fetch_or(1, std::memory_order_acquire);
-    if (o & 1)
+    D l_ = l.fetch_or(1, std::memory_order_acquire);
+    if (l_ & 1)
       return false;
     unlock_shared();
-    while (l.load(std::memory_order_acquire) & ~(1)) {
+    while (l.load(std::memory_order_acquire) & ~(1UL)) {
+      std::this_thread::yield();
     }
     return true;
   }
 
   void unlock() { l.store(0, std::memory_order_release); }
+
   void unlock_shared() { l.fetch_sub(2, std::memory_order_release); }
 
 private:
-  std::atomic<uint8_t> l;
+  std::atomic<D> l;
 };
 
-class mcs_mutex {
-public:
-  mcs_mutex() : tail(nullptr) {}
-
-  void lock() {
-    mcs_node &my_node = my_node_spe;
-    mcs_node *pred = tail.exchange(&my_node, std::memory_order_acquire);
-    if (pred != nullptr) {
-      my_node.locked = true;
-      pred->next = &my_node;
-      while (my_node.locked) {
-        std::this_thread::yield();
-      }
-    }
-  }
-  bool try_lock() {
-    mcs_node &my_node = my_node_spe;
-    mcs_node *node_ptr = nullptr;
-    return tail.compare_exchange_weak(node_ptr, &my_node,
-                                      std::memory_order_acquire);
-  }
-  void unlock() {
-    mcs_node &my_node = my_node_spe;
-    mcs_node *node_ptr = &my_node;
-    if (my_node.next == nullptr) {
-      if (tail.compare_exchange_weak(node_ptr, nullptr,
-                                     std::memory_order_release))
-        return;
-      while (my_node.next == nullptr) {
-        std::this_thread::yield();
-      }
-    }
-    my_node.next->locked = false;
-    my_node.next = nullptr;
-  }
-
-private:
-  struct mcs_node {
-    volatile bool locked = false;
-    volatile mcs_node *next = nullptr;
-  } __attribute__((aligned(64)));
-
-  local_thread_specific<mcs_node> my_node_spe __attribute__((aligned(64)));
-  std::atomic<mcs_node *> tail;
-};
-
-template <typename Mutex> class SingleFlight {
-public:
-  template <typename F, typename... Args> void call(F &&fn, Args &&...args) {
-    if (mu.try_lock()) {
-      fn(std::forward<Args>(args)...);
-    } else {
-      mu.lock();
-    }
-    mu.unlock();
-  }
-
-private:
-  Mutex mu;
-};
+using intention_mutex_b8 = __intention_mutex_impl<uint8_t>;
+using intention_mutex_b16 = __intention_mutex_impl<uint16_t>;
+using intention_mutex_b32 = __intention_mutex_impl<uint32_t>;
+using intention_mutex_b64 = __intention_mutex_impl<uint64_t>;
 
 #endif // __EXTEND_MUTEX_H__

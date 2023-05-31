@@ -43,7 +43,7 @@ template <typename Iter> double variance(Iter first, Iter last) {
 template <typename Iter, typename BinaryOperation>
 double variance(Iter first, Iter last, BinaryOperation op) {
   using T = decltype(*first);
-  double avg = average(first, last);
+  double avg = average(first, last, op);
   return average(first, last, [avg, &op](const T x, const double p) {
     double tmp = op(x, -avg);
     return p + tmp * tmp;
@@ -63,110 +63,158 @@ double stddeviation(Iter first, Iter last, BinaryOperation op) {
  * @brief Generates random number according zipfian distribution.
  * It is defined as: P(X=k)= C / k^q, 1 <= k <= n
  */
-class zipf_distribution {
+template <typename IntType = int> class zipf_distribution {
 public:
-  zipf_distribution(uint32_t n, double q = 1.0) : n_(n), q_(q) {
-    std::vector<double> pdf(n);
-    for (uint32_t i = 0; i < n; ++i) {
-      pdf[i] = std::pow((double)i + 1, -q);
+  typedef IntType result_type;
+
+  zipf_distribution(IntType max, double theta)
+      : m_max(max), m_theta(theta), m_dist(0.0, 1.0) {
+    m_c = std::pow(m_max, -m_theta) / zeta(m_theta, m_max);
+    m_q = std::pow(2.0, -m_theta);
+    m_h = harmonic(m_max);
+    m_v = m_dist(m_gen);
+  }
+
+  /**
+   * @brief 返回zipf分布随机数[0, max)
+   *
+   * @tparam Generator
+   * @param g
+   * @return IntType
+   */
+  template <typename Generator> IntType operator()(Generator &g) {
+    while (true) {
+      double u = m_dist(g) - 0.5;
+      double y = std::floor(std::pow(m_max + 0.5, m_v - u) - 0.5);
+      if (y < 1 || y > m_max)
+        continue;
+      double k = std::floor(y);
+      m_v = m_dist(g);
+      if (m_v >= m_q * std::pow(k + 1, m_theta) / (m_h + k))
+        continue;
+      return static_cast<IntType>(k) - 1;
     }
-    dist_ = std::discrete_distribution<uint32_t>(pdf.begin(), pdf.end());
   }
-
-  template <typename Generator> uint32_t operator()(Generator &g) {
-    return dist_(g) + 1;
-  }
-
-  uint32_t min() { return 1; }
-  uint32_t max() { return n_; }
 
 private:
-  uint32_t n_;
-  double q_;
-  std::discrete_distribution<uint32_t> dist_;
+  IntType m_max;
+  double m_theta;
+  double m_c;
+  double m_q;
+  double m_h;
+  double m_v;
+  std::mt19937 m_gen;
+  std::uniform_real_distribution<double> m_dist;
+
+  static double zeta(double theta, IntType n) {
+    double sum = 0.0;
+    for (IntType i = 1; i <= n; ++i)
+      sum += std::pow(i, -theta);
+    return sum;
+  }
+
+  double harmonic(IntType n) const { return m_c * zeta(m_theta, n); }
 };
 
-template <typename D> class Histogram {
+class Histogram {
 public:
-  // [min, upper)
-  Histogram(D min, D upper, D bcount = 10000)
-      : min_(min), upper_(upper), interval_((upper - min) / bcount), count_(0) {
-    hist_.assign(bcount, 0);
+  Histogram(int nr_buckets, double min_value, double max_value)
+      : nr_buckets(nr_buckets), min_value(min_value),
+        max_value(max_value),
+        bucket_width((max_value - min_value) / nr_buckets),
+        buckets(nr_buckets, 0) {}
+
+  ~Histogram() = default;
+
+  void add(double value) {
+    if (value < min_value || value > max_value) {
+      return;
+    }
+
+    int bucket = get_bucket(value);
+    ++buckets[bucket];
   }
 
-  void clear() {
-    count_ = 0;
-    hist_.assign(hist_.size(), 0);
+  void clear() { std::fill(buckets.begin(), buckets.end(), 0); }
+
+  int size() const {
+    int total_count = 0;
+    for (int count : buckets) {
+      total_count += count;
+    }
+    return total_count;
   }
 
-  const std::vector<uint64_t> &get_hist() const { return hist_; }
+  int percentile(double p) const {
+    if (p < 0 || p > 100) {
+      // Invalid percentile value
+      return -1;
+    }
 
-  void add_sample(D d) { add_sample_n(d, 1); }
+    int total_count = size();
+    int count_so_far = 0;
+    for (int i = 0; i < nr_buckets; ++i) {
+      count_so_far += buckets[i];
+      if (count_so_far / (double)total_count * 100 >= p) {
+        return i;
+      }
+    }
+
+    // Should not reach here
+    return -1;
+  }
 
   double average() const {
-    double S = 0;
-    for (uint32_t i = 0; i < hist_.size(); ++i) {
-      S += hist_[i] * ((i + 0.5) * interval_ + min_);
+    double sum = 0;
+    for (int i = 0; i < nr_buckets; ++i) {
+      sum += get_value(i) * get_count(i);
     }
-    return S / count_;
+    return sum / size();
   }
 
-  double percentile(double p) const { return percentile({p})[0]; }
-
-  std::vector<double> percentile(const std::vector<double> &p) const {
-    if (p.size() == 0)
-      return {};
-
-    {
-      double pre = p.front();
-      if (pre <= 0)
-        throw "percentile can't be less than 0";
-      for (size_t i = 1; i < p.size(); ++i) {
-        if (p[i] <= pre)
-          throw "percentile arg list must be upper-sorted";
-        pre = p[i];
-      }
+  friend Histogram merge(Histogram &a, Histogram &b) {
+    Histogram new_histogram(std::max(a.nr_buckets, b.nr_buckets),
+                            std::min(a.min_value, b.max_value),
+                            std::max(a.max_value, b.max_value));
+    for (int i = 0; i < a.nr_buckets; ++i) {
+      new_histogram.buckets[new_histogram.get_bucket(a.get_value(i))] +=
+          a.get_count(i);
     }
-
-    size_t pi = 0;
-    uint64_t pd = 0;
-    std::vector<double> right_border(p.size(), hist_.size() - 1);
-    for (uint32_t i = 0; i < hist_.size(); ++i) {
-      pd += hist_[i];
-      if (pd >= p[pi] * count_) {
-        right_border[pi++] = i;
-        if (pi == p.size())
-          break;
-      }
+    for (int i = 0; i < b.nr_buckets; ++i) {
+      new_histogram.buckets[new_histogram.get_bucket(b.get_value(i))] +=
+          b.get_count(i);
     }
-    for (size_t i = 0; i < right_border.size(); ++i) {
-      right_border[i] = (right_border[i] + 0.5) * interval_ + min_;
-    }
-    return right_border;
-  }
-
-  static Histogram<D> merge(Histogram<D> &h1, Histogram<D> &h2) {
-    Histogram<D> nh(std::min(h1.min_, h2.min_), std::max(h1.upper_, h2.upper_),
-                    std::max(h1.hist_.size(), h2.hist_.size()));
-    for (uint32_t i = 0; i < h1.hist_.size(); ++i)
-      nh.add_sample_n((i + 0.5) * h1.interval_ + h1.min_, h1.hist_[i]);
-    for (uint32_t i = 0; i < h2.hist_.size(); ++i)
-      nh.add_sample_n((i + 0.5) * h2.interval_ + h2.min_, h2.hist_[i]);
-    return nh;
+    return new_histogram;
   }
 
 private:
-  D min_, upper_, interval_;
-  uint64_t count_;
-  std::vector<uint64_t> hist_;
-
-  void add_sample_n(D d, int n) {
-    if (d < min_ || d >= upper_)
-      throw std::out_of_range("out of range");
-    uint32_t which_b = (d - min_) / interval_;
-    hist_[which_b] += n;
-    count_ += n;
+  int get_bucket(double value) const {
+    return (value - min_value) / bucket_width;
   }
+
+  double get_value(int bucket) const {
+    if (bucket < 0 || bucket >= nr_buckets) {
+      // Invalid bucket index
+      return -1;
+    }
+
+    return min_value + bucket_width * bucket;
+  }
+
+  int get_count(int bucket) const {
+    if (bucket < 0 || bucket >= nr_buckets) {
+      // Invalid bucket index
+      return -1;
+    }
+
+    return buckets[bucket];
+  }
+
+  const int nr_buckets;
+  const double min_value;
+  const double max_value;
+  const double bucket_width;
+  std::vector<int> buckets;
 };
 
 #endif // __STATISTIC_H__

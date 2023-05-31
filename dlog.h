@@ -11,30 +11,29 @@
 #define __DLOG_H__
 
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
-#include <cerrno>
 #include <pthread.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <cstring>
 
-#define DLOG_STREAM(stream, format, ...)                                       \
-  do {                                                                         \
-    struct timeval tv;                                                         \
-    struct tm tm;                                                              \
-    char tbuf[28];                                                             \
-    gettimeofday(&tv, NULL);                                                   \
-    localtime_r(&tv.tv_sec, &tm);                                              \
-    size_t l = strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S.", &tm);        \
-    sprintf(tbuf + l, "%06d", (int)tv.tv_usec);                                \
-    fprintf(stream, "[%s] [%#lx] %s:%d: " format "\n", tbuf, pthread_self(),   \
-            __FILE__, __LINE__, ##__VA_ARGS__);                                \
+#define DLOG_STREAM(stream, format, ...)                                           \
+  do {                                                                             \
+    struct timeval tv;                                                             \
+    struct tm tm;                                                                  \
+    char tbuf[28];                                                                 \
+    gettimeofday(&tv, NULL);                                                       \
+    localtime_r(&tv.tv_sec, &tm);                                                  \
+    size_t l = strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S.", &tm);            \
+    fprintf(stream, "[%s.%06d] [%#lx] %s:%d: " format "\n", tbuf, (int)tv.tv_usec, \
+            pthread_self(), __FILE__, __LINE__, ##__VA_ARGS__);                    \
   } while (0)
 
 #define DLOG_INFO(format, ...)                                                 \
-  DLOG_STREAM(stderr, "[INFO] " format, ##__VA_ARGS__)
+  DLOG_STREAM(stdout, "[INFO] " format, ##__VA_ARGS__)
 #define DLOG_ERROR(format, ...)                                                \
   DLOG_STREAM(stderr, "[ERROR] " format ": %s", ##__VA_ARGS__, strerror(errno))
 #define DLOG_WARNING(format, ...)                                              \
@@ -63,6 +62,10 @@
       DLOG(format, ##__VA_ARGS__);                                             \
   } while (0)
 
+#ifndef NDEBUG
+
+namespace type_fmt_str_detail {
+
 inline constexpr const char *dlog_type_fmt(const char) { return "%c"; }
 inline constexpr const char *dlog_type_fmt(const short) { return "%hd"; }
 inline constexpr const char *dlog_type_fmt(const int) { return "%d"; }
@@ -72,13 +75,13 @@ inline constexpr const char *dlog_type_fmt(const unsigned char) { return "%hhu";
 inline constexpr const char *dlog_type_fmt(const unsigned short) { return "%hu"; }
 inline constexpr const char *dlog_type_fmt(const unsigned int) { return "%u"; }
 inline constexpr const char *dlog_type_fmt(const unsigned long) { return "%lu"; }
-inline constexpr const char *dlog_type_fmt(const unsigned long long) {
-  return "%llu";
-}
+inline constexpr const char *dlog_type_fmt(const unsigned long long) { return "%llu"; }
 inline constexpr const char *dlog_type_fmt(const float) { return "%f"; }
 inline constexpr const char *dlog_type_fmt(const double) { return "%lf"; }
 inline constexpr const char *dlog_type_fmt(const long double) { return "%llf"; }
 inline constexpr const char *dlog_type_fmt(const void *) { return "%p"; }
+
+} // namespace type_fmt_str_detail
 
 /**
  * Assert the judgment between two values.
@@ -95,7 +98,8 @@ inline constexpr const char *dlog_type_fmt(const void *) { return "%p"; }
       char fmt[] = "Because " #val_a " = %???, " #val_b " = %???";             \
       char tmp[sizeof(fmt) + 42];                                              \
       snprintf(fmt, sizeof(fmt), "Because " #val_a " = %s, " #val_b " = %s",   \
-               dlog_type_fmt(a), dlog_type_fmt(b));                                      \
+               type_fmt_str_detail::dlog_type_fmt(a),                          \
+               type_fmt_str_detail::dlog_type_fmt(b));                         \
       snprintf(tmp, sizeof(tmp), fmt, a, b);                                   \
       DLOG_FATAL("Assertion `" #val_a " " #op " " #val_b "` failed. %s", tmp); \
     }                                                                          \
@@ -107,5 +111,16 @@ inline constexpr const char *dlog_type_fmt(const void *) { return "%p"; }
       DLOG_FATAL("Assertion `" #expr "` failed. " format);                     \
     }                                                                          \
   } while (0)
+
+#else
+
+#define DLOG_EXPR(val_a, op, val_b)                                            \
+  do {                                                                         \
+  } while (0)
+#define DLOG_ASSERT(expr, format...)                                           \
+  do {                                                                         \
+  } while (0)
+
+#endif
 
 #endif // __DLOG_H__

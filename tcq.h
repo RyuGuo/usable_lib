@@ -6,25 +6,24 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 // Multi-Thread Task Combine Packing Queue
-template <typename Tp, typename Rp, typename CTX> class TCQueue {
+template <typename Task, typename Result, typename Alloc = std::allocator<void>>
+class TCQueue {
 public:
-  using T = Tp;
-  using R = Rp;
-  using CTX_t = CTX;
   using UID_t = uint64_t;
 
 private:
-  struct leader_handle;
+  struct future_state;
+  struct future_leader_state;
 
 public:
-  // Task processing return handle
-  class FutureHandle {
+  class future {
   public:
     /**
      * Get the task return value.
@@ -32,146 +31,123 @@ public:
      * to get the UIDs and task return values and their mapping relationships,
      * and then assigns these return values to the corresponding future_handle.
      * The handle is automatically recycled after this function is called.
-     *
-     * @param use_cv Whether to use `std::condition_variable` for waiting
      */
-    virtual R task_get(bool use_cv = true) {
-      this->use_cv = use_cv;
-      if (use_cv) {
-        std::unique_lock<std::mutex> lck(wait_lck);
-        while (!complete_flag)
-          wait_cv.wait(lck);
-      } else {
-        while (!complete_flag)
-          std::this_thread::yield();
-      }
-      R ret = *reinterpret_cast<R *>(re_buf);
-      qu->dealloc_future_handle(this);
-      return ret;
-    }
+    Result get() { return state->get_(); }
 
-    FutureHandle(const FutureHandle &) = delete;
-    FutureHandle &operator=(const FutureHandle &) = delete;
+    future() = default;
+    future(future &&other) : future() { swap(std::move(other)); }
+    future &operator=(future &&other) { swap(std::move(other)); }
 
-  protected:
-    TCQueue *qu;
-    char re_buf[sizeof(R)];
-    bool use_cv;
-    volatile bool complete_flag;
-    std::mutex wait_lck;
-    std::condition_variable wait_cv;
+    future(const future &) = delete;
+    future &operator=(const future &) = delete;
+
+    void swap(future &&other) { state.swap(other.state); }
+
+  private:
+    std::unique_ptr<future_state> state;
 
     friend class TCQueue;
-    friend struct leader_handle;
-    FutureHandle() : use_cv(true), complete_flag(false) {}
-    virtual ~FutureHandle() {};
   };
 
 private:
-  struct leader_handle : public FutureHandle {
-    R task_get(bool) override {
-      std::vector<std::pair<UID_t, R>> b = this->qu->hook_batch_ret_collection(
-          *reinterpret_cast<CTX_t *>(uctx_buf), uid_map.size());
+  template <typename U>
+  using rebind_alloc =
+      typename std::allocator_traits<Alloc>::template rebind_alloc<U>;
+
+  using result_alloc_type = rebind_alloc<Result>;
+  using future_state_alloc_type = rebind_alloc<future_state>;
+  using future_leader_state_alloc_type = rebind_alloc<future_leader_state>;
+  using uid_alloc_type = rebind_alloc<UID_t>;
+  using task_alloc_type = rebind_alloc<Task>;
+  using promise_result_alloc_type = rebind_alloc<std::promise<Result>>;
+
+  struct future_state {
+    virtual Result get_() { return fu.get(); }
+
+    virtual ~future_state() {}
+
+    void *operator new(size_t n) {
+      return future_state_alloc_type().allocate(n);
+    }
+
+    void operator delete(void *ptr, size_t n) {
+      return future_state_alloc_type().deallocate(
+          static_cast<future_state *>(ptr), n);
+    }
+
+    std::future<Result> fu;
+  };
+
+  struct future_leader_state : public future_state {
+    virtual Result get_() override {
+      process_batch();
+      return future_state::get_();
+    }
+
+    future_leader_state(TCQueue &qu)
+        : processed(false), qu(qu), uid_map(qu.max_count * 3 / 2),
+          pro_queue(qu.max_count) {}
+
+    void process_batch() {
+      if (processed)
+        return;
+
+      std::vector<std::pair<UID_t, Result>> b =
+          qu.hook_batch_ret_collection(uctx_ptr, uid_map.size());
       if (b.size() != uid_map.size())
         throw "size error";
 
-      // Assign the task return value to the corresponding future_handle.
+      // Assign the task return value to the corresponding future.
       for (auto &p : b) {
         auto it = uid_map.find(p.first);
         if (it == uid_map.end())
           throw "uid error";
         uint32_t idx = it->second;
-        FutureHandle *fh = fu_queue[idx];
-        new (fh->re_buf) R(p.second);
 
-        if (fh->use_cv) {
-          std::unique_lock<std::mutex> lck(fh->wait_lck);
-          fh->complete_flag = true;
-          lck.unlock();
-          fh->wait_cv.notify_one();
-        } else {
-          fh->complete_flag = true;
-        }
+        std::promise<Result> &pro = pro_queue[idx];
+        pro.set_value(p.second);
       }
-      R ret = *reinterpret_cast<R *>(this->re_buf);
-      this->qu->dealloc_leader_handle(this);
-      return ret;
+
+      processed = true;
     }
 
-    leader_handle(uint32_t max_count) : uid_map(max_count * 3 / 2) {
-      uid_queue = new UID_t[max_count];
-      task_queue = static_cast<T *>(::operator new(sizeof(T) * max_count));
-      fu_queue = new FutureHandle *[max_count];
-    }
-    ~leader_handle() override {
-      delete[] uid_queue;
-      delete[] task_queue;
-      delete[] fu_queue;
-      reinterpret_cast<CTX_t *>(uctx_buf)->~CTX_t();
+    void *operator new(size_t n) {
+      return future_leader_state_alloc_type().allocate(n);
     }
 
-    std::unordered_map<UID_t, uint32_t> uid_map;
-    UID_t *uid_queue;
-    T *task_queue;
-    FutureHandle **fu_queue;
-    char uctx_buf[sizeof(CTX_t)];
+    void operator delete(void *ptr, size_t n) {
+      return future_leader_state_alloc_type().deallocate(
+          static_cast<future_leader_state *>(ptr), n);
+    }
+
+    std::unordered_map<UID_t, uint32_t, std::hash<UID_t>, std::equal_to<UID_t>,
+                       rebind_alloc<std::pair<UID_t, uint32_t>>>
+        uid_map;
+    std::vector<std::promise<Result>, promise_result_alloc_type> pro_queue;
+
+    TCQueue &qu;
+    void *uctx_ptr;
+
+    bool processed;
   };
 
   // Get the serial number of the queue lock-freed.
   uint32_t enqueue_ready() {
-    uint32_t cnt = queue_cnt_.load(std::memory_order_relaxed);
-    while (1) {
-      if (cnt == max_count)
-        return -1;
-      if (queue_cnt_.compare_exchange_weak(cnt, cnt + 1,
-                                           std::memory_order_acquire))
-        return cnt;
-      std::this_thread::yield();
-    }
+    uint32_t cnt = queue_cnt.fetch_add(1, std::memory_order_acquire);
+    if (cnt >= max_count)
+      return -1;
+    return cnt;
   }
 
   // Confirmation after queue insertion.
-  void enqueue_confirm() { queue_cnt.fetch_add(1, std::memory_order_release); }
+  void enqueue_confirm() {
+    queue_try_cnt.fetch_add(1, std::memory_order_release);
+  }
 
-  uint64_t gettime() {
+  uint64_t get_time() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-  }
-
-  FutureHandle *alloc_future_handle() {
-    std::unique_lock<spin_mutex_b8> lck(fh_pool_lck);
-    if (free_fh.empty())
-      return new FutureHandle();
-    FutureHandle *fh = free_fh.back();
-    free_fh.pop_back();
-    lck.unlock();
-    fh->complete_flag = false;
-    fh->use_cv = true;
-    return fh;
-  }
-
-  void dealloc_future_handle(FutureHandle *fh) {
-    std::unique_lock<spin_mutex_b8> lck(fh_pool_lck);
-    free_fh.push_back(fh);
-  }
-
-  leader_handle *alloc_leader_handle() {
-    std::unique_lock<spin_mutex_b8> lck(lh_pool_lck);
-    if (free_lh.empty())
-      return new leader_handle(max_count);
-    leader_handle *lh = free_lh.back();
-    free_lh.pop_back();
-    lck.unlock();
-    lh->uid_map.clear();
-    lh->complete_flag = false;
-    lh->use_cv = true;
-    return lh;
-  }
-
-  void dealloc_leader_handle(leader_handle *lh) {
-    std::unique_lock<spin_mutex_b8> lck(lh_pool_lck);
-    free_lh.push_back(lh);
   }
 
 public:
@@ -184,17 +160,9 @@ public:
    * @param wait_us   Queue Wait Time
    */
   TCQueue(uint32_t max_count, uint32_t wait_us)
-      : queue_valid(false), max_count(max_count), wait_us(wait_us) {
-    free_fh.reserve(max_count);
-  }
-  ~TCQueue() {
-    for (auto &fh : free_fh) {
-      delete fh;
-    }
-    for (auto &lh : free_lh) {
-      delete lh;
-    }
-  }
+      : queue_valid(false), max_count(max_count), wait_us(wait_us) {}
+  ~TCQueue() {}
+
   TCQueue(const TCQueue &) = delete;
   TCQueue &operator=(const TCQueue &) = delete;
 
@@ -203,55 +171,81 @@ public:
    * @param uid user-defined task id
    * @param task user task
    */
-  FutureHandle &task_enqueue(UID_t uid, const T &task) {
-    FutureHandle *_handle = nullptr;
+  future task_enqueue(UID_t uid, Task &&task) {
+    std::promise<Result> pro(std::allocator_arg, result_alloc_type());
+    future fu;
+
   retry:
     // The purpose of `en_lck` is to distinguish between leader and follower.
     if (en_lck.try_lock()) {
-      leader_handle *lh = alloc_leader_handle();
-      queue_cnt_ = 0;
-      queue_cnt = 0;
-      fu_queue = lh->fu_queue;
-      uid_queue = lh->uid_queue;
-      task_queue = lh->task_queue;
+      auto fls = std::make_unique<future_leader_state>(*this);
+
+      // Until `queue_valid` is set to true, other threads will keep retrying,
+      // so queues can be initialised thread-safely.
+
+      std::vector<UID_t, uid_alloc_type> uid_queue_(max_count);
+      std::vector<Task, task_alloc_type> task_queue_(max_count);
+
+      queue_cnt.store(0, std::memory_order_relaxed);
+      queue_try_cnt.store(0, std::memory_order_relaxed);
+      uid_queue.swap(uid_queue_);
+      task_queue.swap(task_queue_);
+      pro_queue.swap(fls->pro_queue);
       ++queue_ver;
 
+      // The leader must be able to queue tasks, so it needs to get the `idx`
+      // before `queue_valid` is set to true.
       uint32_t idx = enqueue_ready();
 
-      // Making the queue available.
+      // Making the queues available.
       queue_valid = true;
 
-      uint64_t time_s = gettime(), time_e;
+      uint64_t time_s = get_time(), time_e;
 
-      lh->qu = this;
-      _handle = lh;
-      uid_queue[idx] = uid;
-      task_queue[idx] = task;
-      fu_queue[idx] = lh;
+      fls->fu = pro.get_future();
+
+      uid_queue[idx] = std::move(uid);
+      task_queue[idx] = std::move(task);
+      pro_queue[idx] = std::move(pro);
+
       enqueue_confirm();
 
       // Polling to determine if the queue is full or timeout.
       do {
         std::this_thread::yield();
-        time_e = gettime();
-      } while (time_e - time_s < wait_us && queue_cnt < max_count);
+        time_e = get_time();
+      } while (time_e - time_s < wait_us &&
+               queue_try_cnt.load(std::memory_order_relaxed) < max_count);
+
       queue_valid = false;
 
       // Ensure that the current followers have finished queue operations or are
-      // waiting.
+      // waiting (etc. `if (!queue_valid) goto retry;` ).
       wlck.lock();
       wlck.unlock();
 
-      uint32_t len = queue_cnt;
+      // We can hold queues thread-safely until `en_lck` unlocking.
+
+      uint32_t len = queue_try_cnt.load(std::memory_order_relaxed);
+
+      uid_queue.swap(uid_queue_);
+      task_queue.swap(task_queue_);
+      pro_queue.swap(fls->pro_queue);
+
       en_lck.unlock();
 
-      new (lh->uctx_buf)
-          CTX_t(hook_batch_collection(lh->uid_queue, task_queue, len));
+      uid_queue_.resize(len);
+      task_queue_.resize(len);
+      fls->pro_queue.resize(len);
+
+      fls->uctx_ptr = hook_batch_collection(uid_queue_, task_queue_);
 
       // Mapping UIDs to tasks.
       for (uint32_t i = 0; i < len; ++i) {
-        lh->uid_map.insert(std::make_pair(lh->uid_queue[i], i));
+        fls->uid_map.insert(std::make_pair(uid_queue_[i], i));
       }
+
+      fu.state = std::move(fls);
     } else {
       // The purpose of double-locking is to prevent access to the queue from
       // continuing even after the queue has failed.
@@ -279,47 +273,47 @@ public:
         goto retry;
       }
 
-      FutureHandle *fh = alloc_future_handle();
-      fh->qu = this;
-      _handle = fh;
+      fu.state = std::make_unique<future_state>();
+      fu.state->fu = pro.get_future();
 
-      uid_queue[idx] = uid;
-      task_queue[idx] = task;
-      fu_queue[idx] = fh;
+      uid_queue[idx] = std::move(uid);
+      task_queue[idx] = std::move(task);
+      pro_queue[idx] = std::move(pro);
+
       enqueue_confirm();
 
       wlck.unlock_shared();
     }
-    return *_handle;
+
+    return fu;
   }
 
   // Processes all tasks in the queue. For example, packing and send().
-  std::function<CTX_t(const UID_t *uids, const T *tasks, uint32_t len)>
+  std::function<void *(const std::vector<UID_t, uid_alloc_type> &uids,
+                       const std::vector<Task, task_alloc_type> &tasks)>
       hook_batch_collection;
+
   // Get the mapping of UID to the return value of a task. For example, recv()
   // and parsing.
-  std::function<std::vector<std::pair<UID_t, R>>(CTX_t &ctx, uint32_t need_len)>
+  std::function<std::vector<std::pair<UID_t, Result>,
+                            rebind_alloc<std::pair<UID_t, Result>>>(
+      void *ctx, uint32_t need_len)>
       hook_batch_ret_collection;
 
 private:
   spin_mutex_b8 en_lck;
-  shared_mutex_u8 wlck;
+  shared_mutex_b8 wlck;
   volatile bool queue_valid;
   volatile uint8_t queue_ver;
-  uint32_t max_count;
-  uint32_t wait_us;
-  UID_t *uid_queue;
-  T *task_queue;
-  FutureHandle **fu_queue;
-  std::atomic<uint32_t> queue_cnt_;
-  std::atomic<uint32_t> queue_cnt;
+  const uint32_t max_count;
+  const uint32_t wait_us;
 
-  // Handle recycling bin
-  spin_mutex_b8 fh_pool_lck;
-  std::vector<FutureHandle *> free_fh;
-  char padding[64 - sizeof(fh_pool_lck) - sizeof(free_fh)];
-  spin_mutex_b8 lh_pool_lck;
-  std::vector<leader_handle *> free_lh;
+  std::vector<UID_t, uid_alloc_type> uid_queue;
+  std::vector<Task, task_alloc_type> task_queue;
+  std::vector<std::promise<Result>, promise_result_alloc_type> pro_queue;
+
+  std::atomic<uint32_t> queue_cnt;
+  std::atomic<uint32_t> queue_try_cnt;
 };
 
 #endif // __TCQ_H__

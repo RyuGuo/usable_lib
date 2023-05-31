@@ -9,9 +9,9 @@ Test machine parameters:
 cons: the number of consumers
 prod: the number of produsers
 
-# Hts Mode
+# Default Mode
 
-Hts Mode(Hard tail mode) guarantees a consistent order of incoming and outgoing queues, although this approach may result in performance degradation.
+Multi-producer (/multi-consumer) mode. This is a default enqueue (/dequeue) mode for the queue. In this mode multiple threads can enqueue (/dequeue) objects to (/from) the queue.
 
 ## cons = 1
 
@@ -118,9 +118,9 @@ prod|rte_ring|clqueue
 20|1.57454|0.799099
 
 
-# Rts Mode
+# RTS Mode
 
-Rts Mode(relax tail mode) relaxes the synchronisation of tails, which will result in a significant performance increase, but makes it impossible to guarantee a consistent sequence of enqueue and dequeue.
+RTS Mode(relax tail mode) relaxes the synchronisation of tails, which will result in a significant performance increase, but makes it impossible to guarantee a consistent sequence of enqueue and dequeue.
 
 ## cons = 1
 

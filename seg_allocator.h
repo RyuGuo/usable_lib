@@ -2,33 +2,27 @@
 #define __SEG_ALLOCATOR_H__
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <set>
 
-struct SegAllocator {
-  std::mutex lock;
-  std::set<std::pair<size_t, uint64_t>> free_seg_set_siz;
-  std::map<uint64_t, size_t> free_seg_set_off;
-  uint64_t base;
-
-  void init(uint64_t base, size_t size) {
+class SegAllocator {
+public:
+  SegAllocator(void *base, size_t size)
+      : base(reinterpret_cast<uintptr_t>(base)), size(size) {
     free_seg_set_siz.clear();
     free_seg_set_off.clear();
-    free_seg_set_siz.insert(std::make_pair(size, base));
-    free_seg_set_off.insert(std::make_pair(base, size));
+    free_seg_set_siz.insert(std::make_pair(size, this->base));
+    free_seg_set_off.insert(std::make_pair(this->base, size));
   }
-  bool has_free_seg(size_t size) const {
-    auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
-    return iter != free_seg_set_siz.end();
-  }
-  uint64_t allocate(size_t size) {
-    std::unique_lock<std::mutex> lck(lock);
+
+  void *allocate(size_t size) {
     auto iter = free_seg_set_siz.lower_bound(std::make_pair(size, 0UL));
     if (iter == free_seg_set_siz.end()) {
-      return -1;
+      return nullptr;
     }
-    uint64_t off = iter->second;
+    uintptr_t off = iter->second;
     size_t less = iter->first - size;
     if (less > 0) {
       free_seg_set_off.insert(std::make_pair(off + size, less));
@@ -36,20 +30,22 @@ struct SegAllocator {
     }
     free_seg_set_off.erase(iter->second);
     free_seg_set_siz.erase(iter);
-    return off;
+    return reinterpret_cast<void *>(off);
   }
-  uint64_t placement_allocate(uint64_t off, size_t size) {
-    std::unique_lock<std::mutex> lck(lock);
+
+  void *placement_allocate(void *p, size_t size) {
+    uintptr_t off = reinterpret_cast<uintptr_t>(p);
+
     auto iter = std::upper_bound(
         free_seg_set_off.rbegin(), free_seg_set_off.rend(), off,
         [](const uint64_t a, std::pair<const uint64_t, size_t> b) {
           return a >= b.first;
         });
     if (iter == free_seg_set_off.rend()) {
-      return -1;
+      return nullptr;
     }
     if (iter->first + iter->second < off + size) {
-      return -1;
+      return nullptr;
     }
     size_t less = iter->second - size;
     if (less == 0) {
@@ -71,10 +67,13 @@ struct SegAllocator {
       free_seg_set_off.insert(std::make_pair(off + size, less - iter->second));
       free_seg_set_siz.insert(std::make_pair(less - iter->second, off + size));
     }
-    return off;
+
+    return p;
   }
-  void deallocate(uint64_t off, size_t size) {
-    std::unique_lock<std::mutex> lck(lock);
+
+  void deallocate(void *p, size_t size) {
+    uintptr_t off = reinterpret_cast<uintptr_t>(p);
+
     auto next = free_seg_set_off.lower_bound(off), iter = next;
     int flag = 0;
     // check if merge next seg
@@ -117,31 +116,40 @@ struct SegAllocator {
       break;
     }
   }
-};
-struct SegAllocatorGreater : public SegAllocator {
-  size_t size;
 
-  void init(uint64_t base, size_t size) {
-    this->base = base;
-    this->size = size;
-    SegAllocator::init(base, size);
+protected:
+  std::set<std::pair<size_t, uintptr_t>> free_seg_set_siz;
+  std::map<uintptr_t, size_t> free_seg_set_off;
+  uintptr_t base;
+  size_t size;
+};
+
+class SegAllocatorReverse : public SegAllocator {
+public:
+  SegAllocatorReverse(void *base, size_t size) : SegAllocator(base, size) {}
+
+  void *allocate(size_t size) {
+    void *p = SegAllocator::allocate(size);
+    if (p == nullptr)
+      return nullptr;
+    return reverse_ptr(p, size);
   }
-  uint64_t allocate(size_t size) {
-    uint64_t ret = SegAllocator::allocate(size);
-    if (ret == -1)
-      return -1;
-    return base + this->size - 1 - ret + base - size;
+
+  void *placement_allocate(void *p, size_t size) {
+    void *rp = SegAllocator::placement_allocate(reverse_ptr(p, size), size);
+    if (rp == nullptr)
+      return nullptr;
+    return p;
   }
-  uint64_t placement_allocate(uint64_t off, size_t size) {
-    uint64_t p = base + this->size - 1 - off + base - size;
-    uint64_t ret = SegAllocator::placement_allocate(p, size);
-    if (ret == -1)
-      return -1;
-    return off;
+
+  void deallocate(void *p, size_t size) {
+    SegAllocator::deallocate(reverse_ptr(p, size), size);
   }
-  void deallocate(uint64_t off, size_t size) {
-    uint64_t p = base + this->size - 1 - off + base - size;
-    SegAllocator::deallocate(p, size);
+
+private:
+  void *reverse_ptr(void *p, size_t size) {
+    return reinterpret_cast<void *>(
+        base + this->size - 1 - reinterpret_cast<uintptr_t>(p) + base - size);
   }
 };
 

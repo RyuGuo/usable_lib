@@ -19,21 +19,21 @@ constexpr uint32_t upper_power_of_2(uint32_t n) {
 
 const uint32_t IT = 1000000;
 int prod_th_num, cons_th_num;
-int _ts_ = 0; // 0: hts, 1: rts
+int _ts_ = 0; // 0: default, 1: rts
 
 uint32_t conq_flag_get() {
   uint32_t flag = 0;
   if (prod_th_num == 1) {
     flag |= ConQueueMode::F_SP_ENQ;
   } else if (_ts_ == 0) {
-    flag |= ConQueueMode::F_MP_HTS_ENQ;
+    flag |= ConQueueMode::F_MP_ENQ;
   } else {
     flag |= ConQueueMode::F_MP_RTS_ENQ;
   }
   if (cons_th_num == 1) {
     flag |= ConQueueMode::F_SC_DEQ;
   } else if (_ts_ == 0) {
-    flag |= ConQueueMode::F_MC_HTS_DEQ;
+    flag |= ConQueueMode::F_MC_DEQ;
   } else {
     flag |= ConQueueMode::F_MC_RTS_DEQ;
   }
@@ -42,7 +42,7 @@ uint32_t conq_flag_get() {
 
 template <typename T> struct TestQueueModelBase {
   virtual ~TestQueueModelBase(){};
-  virtual void enqueue(T x) = 0;
+  virtual bool enqueue(T x) = 0;
   virtual bool dequeue(T &x) = 0;
 };
 
@@ -60,7 +60,8 @@ template <typename Q> struct queue_bench : public mbench_base {
   void test_thread_env_init(int thread_id) override {}
   void test_thread_op(int thread_id, uint32_t n) override {
     if (thread_id < prod_th_num) {
-      q.enqueue(n);
+      while (!q.enqueue(n))
+        ;
     } else {
       uint32_t r = 0;
       while (!q.dequeue(r)) {
@@ -93,7 +94,9 @@ template <typename Q> struct queue_bench : public mbench_base {
 struct ConQ : public TestQueueModelBase<uint32_t>, ConQueue<uint32_t> {
   ConQ() : ConQueue<uint32_t>(upper_power_of_2(IT), conq_flag_get()) {}
   virtual ~ConQ() override {}
-  virtual void enqueue(uint32_t x) override { ConQueue<uint32_t>::push(x); }
+  virtual bool enqueue(uint32_t x) override {
+    return ConQueue<uint32_t>::push(x);
+  }
   virtual bool dequeue(uint32_t &x) override {
     return ConQueue<uint32_t>::pop(&x);
   }
@@ -102,8 +105,8 @@ struct ConQ : public TestQueueModelBase<uint32_t>, ConQueue<uint32_t> {
 struct CLQ : public TestQueueModelBase<uint32_t>, CLQueue<uint32_t> {
   CLQ() : CLQueue<uint32_t>(upper_power_of_2(IT), conq_flag_get()) {}
   virtual ~CLQ() override {}
-  virtual void enqueue(uint32_t x) override {
-    CLQueue<uint32_t>::push_unsafe(x);
+  virtual bool enqueue(uint32_t x) override {
+    return CLQueue<uint32_t>::push(x);
   }
   virtual bool dequeue(uint32_t &x) override {
     return CLQueue<uint32_t>::pop(&x);
@@ -118,8 +121,8 @@ struct RteQ : public TestQueueModelBase<uint32_t>,
   using RTE_RING = RteRing<uint32_t, mode, upper_power_of_2(IT)>;
   RteQ() : RTE_RING() {}
   virtual ~RteQ() override {}
-  virtual void enqueue(uint32_t x) override {
-    RTE_RING::enqueue((uint32_t *)(size_t)x);
+  virtual bool enqueue(uint32_t x) override {
+    return RTE_RING::enqueue((uint32_t *)(size_t)x) == RTE_RING::RTE_RING_OK;
   }
   virtual bool dequeue(uint32_t &x) override {
     uint32_t *a;
@@ -139,7 +142,10 @@ struct AtQ : public TestQueueModelBase<uint32_t>,
 
   AtQ() : Q() {}
   virtual ~AtQ() override {}
-  virtual void enqueue(uint32_t x) override { Q::push(x); }
+  virtual bool enqueue(uint32_t x) override {
+    Q::push(x);
+    return true;
+  }
   virtual bool dequeue(uint32_t &x) override {
     x = Q::pop();
     return true;
@@ -154,7 +160,7 @@ struct ModcQ : public TestQueueModelBase<uint32_t>,
 
   ModcQ() : Q() {}
   virtual ~ModcQ() override {}
-  virtual void enqueue(uint32_t x) override { Q::enqueue(x); }
+  virtual bool enqueue(uint32_t x) override { return Q::enqueue(x); }
   virtual bool dequeue(uint32_t &x) override { return Q::try_dequeue(x); }
 };
 
@@ -177,8 +183,7 @@ int main() {
       prod_th_num = v[p];
 
       double rte_ring_throughput, atomic_queue_throughput,
-          moodycamel_throughput, conqueue_throughput, clqueue_throughput,
-          mpscrb_queue_throughput;
+          moodycamel_throughput, conqueue_throughput, clqueue_throughput;
 
       {
         if (cons_th_num == 1 && prod_th_num == 1) {

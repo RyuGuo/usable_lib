@@ -26,7 +26,7 @@ template <typename T> void aligned_delete(T *ptr, size_t n) {
 
 template <typename T, typename FT, size_t FT_OFFSET>
 struct __flexible_array_impl__ final : public T {
-  template <typename... Args> void *operator new(size_t, size_t n) {
+  void *operator new(size_t, size_t n) {
     void *p = ::operator new(sizeof(size_t) + FT_OFFSET + n * sizeof(FT));
     size_t *size_ptr = reinterpret_cast<size_t *>(p);
     *size_ptr = n;
@@ -59,28 +59,25 @@ struct __flexible_array_impl__ final : public T {
   }
 };
 
-template <typename T> class local_thread_specific {
+template <typename T> class thread_local_specific {
 public:
-  template <typename... Args>
-  local_thread_specific(Args &&...args)
-      : ctor_refer(new T(std::forward<Args>(args)...)) {
+  template <typename... Args> thread_local_specific() {
     pthread_key_create(&pkey, dtor_func);
   }
-  ~local_thread_specific() { pthread_key_delete(pkey); }
+  ~thread_local_specific() { pthread_key_delete(pkey); }
 
-  local_thread_specific(const local_thread_specific &) = delete;
-  local_thread_specific(local_thread_specific &&) = delete;
-  local_thread_specific &operator=(const local_thread_specific &) = delete;
-  local_thread_specific &operator=(local_thread_specific &&) = delete;
+  thread_local_specific(const thread_local_specific &) = delete;
+  thread_local_specific(thread_local_specific &&) = delete;
+  thread_local_specific &operator=(const thread_local_specific &) = delete;
+  thread_local_specific &operator=(thread_local_specific &&) = delete;
 
   T &set(const T &x) {
     T *ptr = reinterpret_cast<T *>(pthread_getspecific(pkey));
-    if (ptr == nullptr) {
+    if (__glibc_unlikely(ptr == nullptr)) {
       ptr = new T(x);
       pthread_setspecific(pkey, ptr);
     } else {
-      (*ptr).~T();
-      new (ptr) T(x);
+      *ptr = x;
     }
     return *ptr;
   }
@@ -90,15 +87,14 @@ public:
       ptr = new T(std::forward<T>(x));
       pthread_setspecific(pkey, ptr);
     } else {
-      (*ptr).~T();
-      new (ptr) T(std::forward<T>(x));
+      *ptr = std::forward<T>(x);
     }
     return *ptr;
   }
   T &get() {
     T *ptr = reinterpret_cast<T *>(pthread_getspecific(pkey));
     if (__glibc_unlikely(ptr == nullptr)) {
-      ptr = new T(*ctor_refer);
+      ptr = new T();
       pthread_setspecific(pkey, ptr);
     }
     return *ptr;
@@ -110,11 +106,11 @@ public:
 
 private:
   pthread_key_t pkey;
-  T* ctor_refer;
 
   static void dtor_func(void *p) {
     T *ptr = reinterpret_cast<T *>(p);
-    delete ptr;
+    if (ptr)
+      delete ptr;
   }
 };
 

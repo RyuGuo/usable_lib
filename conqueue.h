@@ -19,14 +19,13 @@ enum ConQueueMode {
   F_EXACT_SZ = 4,
   F_MP_RTS_ENQ = 8,
   F_MC_RTS_DEQ = 16,
-  F_MP_HTS_ENQ = 32,
-  F_MC_HTS_DEQ = 64,
+  F_MP_ENQ = 32,
+  F_MC_DEQ = 64,
 };
 template <typename T, typename Alloc = std::allocator<T>> class ConQueue {
 public:
   ConQueue(T *ring, uint32_t max_size,
-           uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                            ConQueueMode::F_MC_HTS_DEQ)
+           uint32_t flags = ConQueueMode::F_MP_ENQ | ConQueueMode::F_MC_DEQ)
       : ring(ring), self_alloc(false), flags(flags), max_size(max_size) {
     prod_head.raw = prod_tail.raw = cons_head.raw = cons_tail.raw = 0;
 
@@ -34,27 +33,25 @@ public:
       throw "ring array is null";
     if (max_size == 0)
       throw "max_size is 0";
-    if ((this->flags & F_SP_ENQ) &&
-        (this->flags & (F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
+    if ((this->flags & F_SP_ENQ) && (this->flags & (F_MP_RTS_ENQ | F_MP_ENQ)))
       throw "queue producer flag error";
-    if ((this->flags & F_MP_RTS_ENQ) && (this->flags & F_MP_HTS_ENQ))
+    if ((this->flags & F_MP_RTS_ENQ) && (this->flags & F_MP_ENQ))
       throw "queue producer flag error";
-    if ((this->flags & F_SC_DEQ) &&
-        (this->flags & (F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
+    if ((this->flags & F_SC_DEQ) && (this->flags & (F_MC_RTS_DEQ | F_MC_DEQ)))
       throw "queue consumer flag error";
-    if ((this->flags & F_MC_RTS_DEQ) && (this->flags & F_MC_HTS_DEQ))
+    if ((this->flags & F_MC_RTS_DEQ) && (this->flags & F_MC_DEQ))
       throw "queue consumer flag error";
 
     // default flag set
-    if (!(this->flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
-      this->flags |= F_MP_HTS_ENQ;
-    if (!(this->flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
-      this->flags |= F_MC_HTS_DEQ;
+    if (!(this->flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_ENQ)))
+      this->flags |= F_MP_ENQ;
+    if (!(this->flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_DEQ)))
+      this->flags |= F_MC_DEQ;
 
     count_mask = aligned_size(max_size, this->flags) - 1;
   }
-  ConQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                                               ConQueueMode::F_MC_HTS_DEQ)
+  ConQueue(uint32_t max_size,
+           uint32_t flags = ConQueueMode::F_MP_ENQ | ConQueueMode::F_MC_DEQ)
       : ConQueue(Alloc().allocate(aligned_size(max_size, flags)), max_size,
                  flags) {
     self_alloc = true;
@@ -85,7 +82,7 @@ public:
         return false;
       new (&ring[to_id(prod_tail.pos)]) T(std::forward<Args>(args)...);
       ++prod_tail.pos;
-    } else if (flags & ConQueueMode::F_MP_HTS_ENQ) {
+    } else if (flags & ConQueueMode::F_MP_ENQ) {
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
       do {
@@ -96,7 +93,7 @@ public:
                                             true, __ATOMIC_ACQUIRE,
                                             __ATOMIC_ACQUIRE));
       new (&ring[to_id(oh.pos)]) T(std::forward<Args>(args)...);
-      hts_update_ht(&prod_tail, 1, oh.pos);
+      default_update_ht(&prod_tail, 1, oh.pos);
     } else {
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
@@ -129,7 +126,7 @@ public:
         new (&ring[to_id(prod_tail.pos + i)]) T(*(first++));
       }
       prod_tail.pos += l;
-    } else if (flags & ConQueueMode::F_MP_HTS_ENQ) {
+    } else if (flags & ConQueueMode::F_MP_ENQ) {
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
       do {
@@ -143,7 +140,7 @@ public:
       for (uint32_t i = 0; i < l; ++i) {
         new (&ring[to_id(oh.pos + i)]) T(*(first++));
       }
-      hts_update_ht(&prod_tail, l, oh.pos);
+      default_update_ht(&prod_tail, l, oh.pos);
     } else {
       union po_val_t oh, nh;
       oh.raw = __atomic_load_n(&prod_head.raw, __ATOMIC_ACQUIRE);
@@ -172,7 +169,7 @@ public:
       ring[to_id(cons_tail.pos)].~T();
 
       ++cons_tail.pos;
-    } else if (flags & ConQueueMode::F_MC_HTS_DEQ) {
+    } else if (flags & ConQueueMode::F_MC_DEQ) {
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
       do {
@@ -184,7 +181,7 @@ public:
                                             __ATOMIC_ACQUIRE));
       new (x) T(std::move(ring[to_id(ot.pos)]));
       ring[to_id(ot.pos)].~T();
-      hts_update_ht(&cons_tail, 1, ot.pos);
+      default_update_ht(&cons_tail, 1, ot.pos);
     } else {
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
@@ -220,7 +217,7 @@ public:
         ++l;
       }
       cons_tail.pos += l;
-    } else if (flags & ConQueueMode::F_MC_HTS_DEQ) {
+    } else if (flags & ConQueueMode::F_MC_DEQ) {
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
       do {
@@ -235,7 +232,7 @@ public:
         new (&*(first++)) T(std::move(ring[to_id(ot.pos + i)]));
         ring[to_id(ot.pos + i)].~T();
       }
-      hts_update_ht(&cons_tail, l, ot.pos);
+      default_update_ht(&cons_tail, l, ot.pos);
     } else {
       union po_val_t ot, nt;
       ot.raw = __atomic_load_n(&cons_head.raw, __ATOMIC_ACQUIRE);
@@ -304,8 +301,8 @@ private:
     return size + 1;
   }
 
-  static void hts_update_ht(volatile po_val_t *ht_, uint32_t n,
-                            uint32_t oht_pos) {
+  static void default_update_ht(volatile po_val_t *ht_, uint32_t n,
+                                uint32_t oht_pos) {
     // Wait for other threads to finish copying
     int rep = 0;
     while (ht_->pos != oht_pos) {
@@ -334,25 +331,25 @@ private:
   }
 };
 
-template <typename T> class CLQueue {
+template <typename T, bool USE_BLOCK = false> class CLQueue {
 public:
-  CLQueue(uint32_t max_size, uint32_t flags = ConQueueMode::F_MP_HTS_ENQ |
-                                              ConQueueMode::F_MC_HTS_DEQ)
+  CLQueue(uint32_t max_size,
+          uint32_t flags = ConQueueMode::F_MP_ENQ | ConQueueMode::F_MC_DEQ)
       : flags(flags) {
     if (max_size == 0)
       throw "max_size is 0";
-    if ((this->flags & F_MP_HTS_ENQ) && (this->flags & F_MP_RTS_ENQ))
+    if ((this->flags & F_MP_ENQ) && (this->flags & F_MP_RTS_ENQ))
       throw "queue producer flag error";
-    if ((this->flags & F_MC_RTS_DEQ) && (this->flags & F_MC_HTS_DEQ))
+    if ((this->flags & F_MC_RTS_DEQ) && (this->flags & F_MC_DEQ))
       throw "queue consumer flag error";
     if (this->flags & F_EXACT_SZ)
       throw "queue exacting size is not supported";
 
     // default flag set
-    if (!(this->flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_HTS_ENQ)))
-      this->flags |= F_MP_HTS_ENQ;
-    if (!(this->flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_HTS_DEQ)))
-      this->flags |= F_MC_HTS_DEQ;
+    if (!(this->flags & (F_SP_ENQ | F_MP_RTS_ENQ | F_MP_ENQ)))
+      this->flags |= F_MP_ENQ;
+    if (!(this->flags & (F_SC_DEQ | F_MC_RTS_DEQ | F_MC_DEQ)))
+      this->flags |= F_MC_DEQ;
 
     // find max_size = SLOT_MAX_INLINE * 2^n
     uint32_t s = SLOT_MAX_INLINE;
@@ -394,10 +391,11 @@ public:
     si = get_si(ot);
     return cl->slots[si];
   }
+
   void clear() {
     for (uint32_t i = tail; i != head; ++i) {
       uint32_t li = get_li(i);
-      cache_line_t *cl = &cls[i];
+      cache_line_t *cl = &cls[li];
       uint32_t si = get_si(i);
       cl->slots[si].~T();
     }
@@ -408,10 +406,12 @@ public:
     }
     cls[0].hf1 = cls[0].tf1 = 1;
   }
+
   bool push(const T &x) {
     return emplace_impl<false>(std::forward<const T &>(x));
   }
   bool push(T &&x) { return emplace_impl<false>(std::forward<T>(x)); }
+
   /**
    * Push an element for better performance without checking queue is full.
    * @warning If queue is full, the thread will occupy a slot as usual, which
@@ -422,9 +422,15 @@ public:
     return emplace_impl<true>(std::forward<const T &>(x));
   }
   bool push_unsafe(T &&x) { return emplace_impl<true>(std::forward<T>(x)); }
+
   template <typename... Args> bool emplace(Args &&...args) {
     return emplace_impl<false>(std::forward<Args>(args)...);
   }
+  template <typename... Args> bool emplace_unsafe(Args &&...args) {
+    return emplace_impl<true>(std::forward<Args>(args)...);
+  }
+
+private:
   template <bool TF, typename... Args> bool emplace_impl(Args &&...args) {
     uint32_t oh, li, next_li, si;
     cache_line_t *cl;
@@ -458,7 +464,7 @@ public:
       si = get_si(oh);
       new (&cl->slots[si]) T(std::forward<Args>(args)...);
 
-      if (flags & F_MP_HTS_ENQ) {
+      if (flags & F_MP_ENQ) {
         int rep = 0;
         while (cl->hf1 != cl->hf2) {
           _mm_pause();
@@ -472,10 +478,14 @@ public:
       }
     }
 
+    // ! If `flag` has `F_MP_RTS_ENQ`, maybe cause write loss error (operator++)
+    // when some producers get same cache line. So this queue need a lot of
+    // cache lines to avoid this problem.
     ++cl->hf2;
     return true;
   }
 
+public:
   bool pop(T *x) {
     uint32_t ot, li, next_li, si;
     cache_line_t *cl;
@@ -485,9 +495,9 @@ public:
       cl = &cls[li];
       if (__glibc_unlikely(cl->hf2 == cl->tf2))
         return false;
-      tail.fetch_add(1, std::memory_order_relaxed);
+      tail.fetch_add(1, std::memory_order_acquire);
       si = get_si(ot);
-      new (x) T(std::move(cl->slots[si]));
+      *x = std::move(cl->slots[si]);
       cl->slots[si].~T();
     } else {
       /**
@@ -529,10 +539,10 @@ public:
         return false;
       }
 
-      new (x) T(std::move(cl->slots[si]));
+      *x = std::move(cl->slots[si]);
       cl->slots[si].~T();
 
-      if (flags & F_MC_HTS_DEQ) {
+      if (flags & F_MC_DEQ) {
         int rep = 0;
         while (cl->tf1 != cl->tf2) {
           _mm_pause();
@@ -546,6 +556,9 @@ public:
       }
     }
 
+    // ! If `flag` has `F_MC_RTS_DEQ`, maybe cause write loss error (operator++)
+    // when some consumers get same cache line. So this queue need a lot of
+    // cache lines to avoid this problem.
     ++cl->tf2;
     return true;
   }
@@ -554,16 +567,20 @@ private:
   static constexpr size_t T_SIZE = sizeof(T);
   static constexpr size_t CACHE_LINE_SIZE = 64;
   static constexpr int T_INLINE_MIN = 7;
+  static constexpr size_t CACHE_LINE_HEADER_SIZE = 8;
 
   static constexpr size_t LINE_SIZE =
-      ((T_INLINE_MIN * T_SIZE + 8) & 0x3f)
-          ? (((T_INLINE_MIN * T_SIZE + 8) & ~(0x3f)) + CACHE_LINE_SIZE)
-          : (T_INLINE_MIN * T_SIZE + 8);
-  static constexpr int SLOT_MAX_INLINE = (LINE_SIZE - 8) / T_SIZE;
+      ((T_INLINE_MIN * T_SIZE + CACHE_LINE_HEADER_SIZE) % CACHE_LINE_SIZE)
+          ? (((T_INLINE_MIN * T_SIZE + CACHE_LINE_HEADER_SIZE) /
+              CACHE_LINE_SIZE * CACHE_LINE_SIZE) +
+             CACHE_LINE_SIZE)
+          : (T_INLINE_MIN * T_SIZE + CACHE_LINE_HEADER_SIZE);
+  static constexpr int SLOT_MAX_INLINE =
+      (LINE_SIZE - CACHE_LINE_HEADER_SIZE) / T_SIZE;
   static constexpr int REP_COUNT = 3;
-  // static constexpr int BLOCK_WIDTH = 64;
+  static constexpr int BLOCK_WIDTH = CACHE_LINE_SIZE;
 
-  /*    cache line size
+  /*      cache line
    * [ f  |    slots    ]
    * [ f  |    slots    ]
    * [ f  |    slots    ]
@@ -587,15 +604,20 @@ private:
   __attribute__((aligned(64))) std::atomic<uint32_t> head;
   __attribute__((aligned(64))) std::atomic<uint32_t> tail;
 
-  inline uint32_t get_li(uint32_t n) {
-    return n & max_line_mask;
-    // return ((n % BLOCK_WIDTH) +
-    //         n / (SLOT_MAX_INLINE * BLOCK_WIDTH) * BLOCK_WIDTH) &
-    //        max_line_mask;
+  uint32_t get_li(uint32_t n) const {
+    if (USE_BLOCK)
+      return ((n % BLOCK_WIDTH) +
+              n / (SLOT_MAX_INLINE * BLOCK_WIDTH) * BLOCK_WIDTH) &
+             max_line_mask;
+    else
+      return n & max_line_mask;
   }
-  inline uint32_t get_si(uint32_t n) {
-    return (n >> max_line_mask_bits) % SLOT_MAX_INLINE;
-    // return (n % (SLOT_MAX_INLINE * BLOCK_WIDTH)) / BLOCK_WIDTH;
+
+  uint32_t get_si(uint32_t n) const {
+    if (USE_BLOCK)
+      return (n % (SLOT_MAX_INLINE * BLOCK_WIDTH)) / BLOCK_WIDTH;
+    else
+      return (n >> max_line_mask_bits) % SLOT_MAX_INLINE;
   }
 };
 
